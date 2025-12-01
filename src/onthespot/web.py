@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 import traceback
-from flask import Flask, jsonify, render_template, redirect, request, send_file, url_for, flash, Response
+from flask import Flask, jsonify, render_template, redirect, request, send_file, url_for, flash, Response, session
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from .accounts import FillAccountPool, get_account_token
 from .api.apple_music import apple_music_get_track_metadata, apple_music_add_account
@@ -166,33 +166,200 @@ class AutoClearWorker(threading.Thread):
 
 
 class User(UserMixin):
-    def __init__(self, id):
+    def __init__(self, id, is_admin=False, is_plex_user=False):
         self.id = id
+        self.is_admin = is_admin
+        self.is_plex_user = is_plex_user
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User(user_id)
+    # Load user with their role from session
+    is_admin = session.get('is_admin', False)
+    is_plex_user = session.get('is_plex_user', False)
+    return User(user_id, is_admin=is_admin, is_plex_user=is_plex_user)
 
 
 login_manager.login_view = "/login"
 
 
+def admin_required(f):
+    """Decorator to require admin access"""
+    from functools import wraps
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            return redirect(url_for('login'))
+        if not current_user.is_admin:
+            flash('Access denied. Admin privileges required.')
+            return redirect(url_for('search'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if not config.get('use_webui_login') or not config.get('webui_username'):
-        user = User('guest')
+        user = User('guest', is_admin=True)  # Guest has admin access
         login_user(user)
+        session['is_admin'] = True
+        session['is_plex_user'] = False
         return redirect(url_for('search'))
 
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
         if username == config.get('webui_username') and password == config.get('webui_password'):
-            user = User(username)
+            user = User(username, is_admin=True)  # Admin credentials = admin access
             login_user(user)
+            session['is_admin'] = True
+            session['is_plex_user'] = False
             return redirect(url_for('search'))
         flash('Invalid credentials, please try again.')
-    return render_template('login.html')
+
+    # Load config for template
+    config_path = os.path.join(config_dir(), 'otsconfig.json')
+    with open(config_path, 'r') as config_file:
+        config_data = json.load(config_file)
+    return render_template('login.html', config=config_data)
+
+
+@app.route('/api/auth/plex', methods=['POST'])
+def auth_plex():
+    """Authenticate user with Plex account"""
+    if not PLEX_AVAILABLE or not plex_api:
+        return jsonify(success=False, error='Plex API not available'), 500
+
+    try:
+        data = request.json
+        auth_token = data.get('authToken')
+
+        if not auth_token:
+            return jsonify(success=False, error='Auth token required'), 400
+
+        # Validate token with Plex.tv and get user info
+        import requests
+        headers = {
+            'Accept': 'application/json',
+            'X-Plex-Token': auth_token,
+            'X-Plex-Client-Identifier': 'onthespot-music-downloader'
+        }
+
+        response = requests.get('https://plex.tv/users/account.json', headers=headers)
+        response.raise_for_status()
+        plex_user = response.json()['user']
+
+        # Check if Plex login is enabled in config
+        if not config.get('use_plex_login', False):
+            return jsonify(success=False, error='Plex login is not enabled'), 403
+
+        username = plex_user.get('username', plex_user.get('email', 'plex_user'))
+        plex_id = plex_user.get('id')
+
+        # Check if user has access to the Plex server (if enabled)
+        is_admin = False
+        if config.get('require_plex_server_access', True):
+            try:
+                server_url = config.get('plex_server_url', 'http://127.0.0.1:32400')
+                owner_plex_token = config.get('plex_auth_token')
+
+                if not owner_plex_token or not server_url:
+                    logger.warning("Plex server access check enabled but server not configured")
+                    return jsonify(success=False, error='Plex server not configured. Contact administrator.'), 403
+
+                # Method 1: Check if user can access the server directly with their token
+                has_access = False
+                try:
+                    test_headers = {
+                        'Accept': 'application/json',
+                        'X-Plex-Token': auth_token
+                    }
+                    test_response = requests.get(f"{server_url}/identity",
+                                                headers=test_headers,
+                                                timeout=5)
+
+                    if test_response.status_code == 200:
+                        has_access = True
+                        logger.info(f"Plex user {username} can access server directly with their token")
+
+                        # Check if they're the owner by comparing tokens
+                        if auth_token == owner_plex_token:
+                            is_admin = True
+                            logger.info(f"Plex user {username} is the server owner (token match)")
+                    else:
+                        logger.debug(f"Direct server access test failed: HTTP {test_response.status_code}")
+                except Exception as e:
+                    logger.debug(f"Direct server access test failed: {str(e)}")
+
+                # Method 2: If direct access failed, check shared users list (for server owners checking who has access)
+                if not has_access:
+                    try:
+                        owner_headers = {
+                            'Accept': 'application/json',
+                            'X-Plex-Token': owner_plex_token,
+                            'X-Plex-Client-Identifier': 'onthespot-music-downloader'
+                        }
+
+                        # First verify if owner_plex_token is valid by getting account info
+                        owner_response = requests.get('https://plex.tv/users/account.json',
+                                                     headers=owner_headers,
+                                                     timeout=5)
+
+                        if owner_response.status_code == 200:
+                            owner_user = owner_response.json()['user']
+                            owner_id = owner_user.get('id')
+
+                            # Check if authenticating user IS the owner
+                            if plex_id == owner_id:
+                                has_access = True
+                                is_admin = True
+                                logger.info(f"Plex user {username} is the server owner (ID match)")
+                            else:
+                                # Get list of shared users
+                                users_response = requests.get('https://plex.tv/api/users',
+                                                            headers=owner_headers,
+                                                            timeout=10)
+
+                                if users_response.status_code == 200:
+                                    import xml.etree.ElementTree as ET
+                                    root = ET.fromstring(users_response.text)
+
+                                    for user_elem in root.findall('.//User'):
+                                        user_id = user_elem.get('id')
+                                        if user_id and int(user_id) == plex_id:
+                                            has_access = True
+                                            logger.info(f"Plex user {username} found in shared users list")
+                                            break
+                        else:
+                            logger.warning(f"Could not verify owner token: HTTP {owner_response.status_code}")
+
+                    except Exception as e:
+                        logger.warning(f"Shared users check failed: {str(e)}")
+
+                if not has_access:
+                    logger.warning(f"Plex user {username} (ID: {plex_id}) does not have access to the server")
+                    logger.info(f"Server URL checked: {server_url}")
+                    return jsonify(success=False, error='You do not have access to this Plex server'), 403
+
+            except Exception as e:
+                logger.error(f"Error checking Plex server access: {str(e)}")
+                logger.exception("Full traceback:")
+                return jsonify(success=False, error=f'Server access verification failed: {str(e)}'), 500
+
+        # Create user session
+        user = User(username, is_admin=is_admin, is_plex_user=True)
+        login_user(user)
+        session['is_admin'] = is_admin
+        session['is_plex_user'] = True
+
+        logger.info(f"User logged in via Plex: {username} (admin: {is_admin})")
+        return jsonify(success=True, user={'username': username, 'email': plex_user.get('email'), 'is_admin': is_admin})
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to validate Plex token: {str(e)}")
+        return jsonify(success=False, error='Invalid Plex token'), 401
+    except Exception as e:
+        logger.error(f"Error during Plex authentication: {str(e)}")
+        return jsonify(success=False, error=str(e)), 500
 
 
 @app.route('/api/logout')
@@ -220,7 +387,7 @@ def search():
     config_path = os.path.join(config_dir(), 'otsconfig.json')
     with open(config_path, 'r') as config_file:
         config_data = json.load(config_file)
-    return render_template('search.html', config=config_data)
+    return render_template('search.html', config=config_data, user=current_user)
 
 
 @app.route('/download_queue')
@@ -229,11 +396,11 @@ def download_queue_page():
     config_path = os.path.join(config_dir(), 'otsconfig.json')
     with open(config_path, 'r') as config_file:
         config_data = json.load(config_file)
-    return render_template('download_queue.html', config=config_data)
+    return render_template('download_queue.html', config=config_data, user=current_user)
 
 
 @app.route('/settings')
-@login_required
+@admin_required
 def settings():
     config_path = os.path.join(config_dir(), 'otsconfig.json')
     with open(config_path, 'r') as config_file:
@@ -244,7 +411,7 @@ def settings():
 @app.route('/about')
 @login_required
 def about():
-    return render_template('about.html', version=config.get("version"), statistics=f"{config.get('total_downloaded_items')} / {format_bytes(config.get('total_downloaded_data'))}")
+    return render_template('about.html', version=config.get("version"), statistics=f"{config.get('total_downloaded_items')} / {format_bytes(config.get('total_downloaded_data'))}", user=current_user)
 
 
 @app.route('/api/search_results')
@@ -545,7 +712,7 @@ def plex_playlists():
                 logger.debug(f"Added playlist: {filename} -> {full_path}")
 
     logger.info(f"Found {len(playlists)} playlists in {m3u_directory}")
-    return render_template('plex_playlists.html', config=config_data, playlists=playlists, m3u_directory=m3u_directory)
+    return render_template('plex_playlists.html', config=config_data, playlists=playlists, m3u_directory=m3u_directory, user=current_user)
 
 
 @app.route('/api/plex/import_playlist', methods=['POST'])
