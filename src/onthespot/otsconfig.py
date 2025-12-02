@@ -88,6 +88,7 @@ class Config:
             "use_webui_login": False, # Enable Web UI Login Page
             "webui_username": "", # Web UI Username
             "webui_password": "", # Web UI Password
+            "web_secret_key": "", # Secret key for web session/remember cookies
 
             # General Settings
             "language": "en_US", # Language
@@ -252,6 +253,10 @@ class Config:
         self.set('_ffmpeg_bin_path', ffmpeg_path)
         self.set('_log_file', os.path.join(cache_dir(), "logs", self.session_uuid, "onthespot.log"))
         self.set('_cache_dir', cache_dir())
+        if not self.get("web_secret_key"):
+            # Persist a stable secret for Flask sessions/remember cookies
+            self.set("web_secret_key", os.urandom(32).hex())
+            self.save()
         try:
             os.makedirs(
                 os.path.dirname(self.get("_log_file")), exist_ok=True

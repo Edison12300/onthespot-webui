@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 # Required for librespot-python
 os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 import argparse
@@ -40,7 +41,10 @@ logger = get_logger("web")
 os.environ['FLASK_ENV'] = 'production'
 web_resources = os.path.join(config.app_root, 'resources', 'web')
 app = Flask('OnTheSpot', template_folder=web_resources, static_folder=web_resources)
-app.secret_key = os.urandom(24)
+app.secret_key = config.get("web_secret_key")
+REMEMBER_DURATION = timedelta(days=90)
+app.config['REMEMBER_COOKIE_DURATION'] = REMEMBER_DURATION
+app.config['PERMANENT_SESSION_LIFETIME'] = REMEMBER_DURATION
 login_manager = LoginManager()
 login_manager.init_app(app)
 
@@ -200,7 +204,8 @@ def admin_required(f):
 def login():
     if not config.get('use_webui_login') or not config.get('webui_username'):
         user = User('guest', is_admin=True)  # Guest has admin access
-        login_user(user)
+        login_user(user, remember=True, duration=REMEMBER_DURATION)
+        session.permanent = True
         session['is_admin'] = True
         session['is_plex_user'] = False
         return redirect(url_for('search'))
@@ -210,7 +215,8 @@ def login():
         password = request.form['password']
         if username == config.get('webui_username') and password == config.get('webui_password'):
             user = User(username, is_admin=True)  # Admin credentials = admin access
-            login_user(user)
+            login_user(user, remember=True, duration=REMEMBER_DURATION)
+            session.permanent = True
             session['is_admin'] = True
             session['is_plex_user'] = False
             return redirect(url_for('search'))
@@ -347,7 +353,8 @@ def auth_plex():
 
         # Create user session
         user = User(username, is_admin=is_admin, is_plex_user=True)
-        login_user(user)
+        login_user(user, remember=True, duration=REMEMBER_DURATION)
+        session.permanent = True
         session['is_admin'] = is_admin
         session['is_plex_user'] = True
 
