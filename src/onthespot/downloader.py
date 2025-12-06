@@ -81,19 +81,28 @@ class RetryWorker(QObject):
 
 
     def run(self):
+        from .runtimedata import get_consecutive_failures
         while self.is_running:
             if download_queue:
                 # First, check if there are any failed downloads
                 has_failed_downloads = False
+                failed_count = 0
                 with download_queue_lock:
                     for local_id in download_queue.keys():
                         if download_queue[local_id]['item_status'] == "Failed":
                             has_failed_downloads = True
-                            break
+                            failed_count += 1
+
+                # If failures are accumulating, back off to let hard restart happen
+                current_failure_count = get_consecutive_failures()
+                if current_failure_count >= 3:
+                    logger.warning(f"High consecutive failure count ({current_failure_count}), backing off to allow hard restart")
+                    time.sleep(10)
+                    continue
 
                 # If there are failed downloads, force reconnect all Spotify accounts
                 if has_failed_downloads:
-                    logger.info("Found failed downloads - forcing Spotify account reconnection before retry")
+                    logger.info(f"Found {failed_count} failed downloads - forcing Spotify account reconnection before retry")
                     from .api.spotify import spotify_re_init_session
 
                     reconnected_count = 0
@@ -108,6 +117,8 @@ class RetryWorker(QObject):
 
                     if reconnected_count > 0:
                         logger.info(f"Successfully reconnected {reconnected_count} Spotify account(s) - now retrying failed downloads")
+                    elif failed_count > 0:
+                        logger.warning(f"Could not reconnect any accounts, but have {failed_count} failed downloads")
 
                 # Now retry the failed downloads
                 with download_queue_lock:
@@ -1227,10 +1238,23 @@ class DownloadWorker(QObject):
                             video.download(item_id)
 
                 except RuntimeError as e:
+                    error_str = str(e).lower()
+                    # Session/auth errors are more serious - count them more heavily
+                    is_session_error = any(x in error_str for x in [
+                        'session', 'auth', 'failed to load audio stream', 
+                        'cannot use account', 'stale'
+                    ])
+                    
                     logger.info(f"Download failed: {item}, Error: {str(e)}\nTraceback: {traceback.format_exc()}")
                     item['item_status'] = 'Failed'
                     self.update_progress(item, self.tr("Failed") if self.gui else "Failed", 0)
-                    increment_failure_count()  # Track failure for worker restart
+                    
+                    # Track failures - session errors count double to trigger restart faster
+                    if is_session_error:
+                        logger.warning("Session-related error detected, incrementing failure count twice")
+                        increment_failure_count()  # Count twice for session errors
+                    increment_failure_count()
+                    
                     self.readd_item_to_download_queue(item)
                     continue
 
@@ -1333,11 +1357,23 @@ class DownloadWorker(QObject):
                 self.readd_item_to_download_queue(item)
                 continue
             except Exception as e:
+                error_str = str(e).lower()
+                # Session/auth errors are more serious - count them more heavily
+                is_session_error = any(x in error_str for x in [
+                    'session', 'auth', 'failed to load audio stream', 
+                    'cannot use account', 'stale'
+                ])
+                
                 logger.error(f"Unknown Exception: {str(e)}\nTraceback: {traceback.format_exc()}")
                 if item['item_status'] != "Cancelled":
                     item['item_status'] = "Failed"
                     self.update_progress(item, self.tr("Failed") if self.gui else "Failed", 0)
-                    increment_failure_count()  # Track failure for worker restart
+                    
+                    # Track failures - session errors count double to trigger restart faster
+                    if is_session_error:
+                        logger.warning("Session-related error detected, incrementing failure count twice")
+                        increment_failure_count()  # Count twice for session errors
+                    increment_failure_count()
                 else:
                     self.update_progress(item, self.tr("Cancelled") if self.gui else "Cancelled", 0)
 

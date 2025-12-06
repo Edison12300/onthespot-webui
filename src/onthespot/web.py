@@ -66,7 +66,8 @@ def trigger_hard_restart(reason):
             return
         _restart_in_progress = True
 
-    logger.warning(f"Hard restart requested: {reason}")
+    logger.error(f"🔄 HARD RESTART INITIATED: {reason}")
+    logger.error("="*80)
 
     try:
         cached_path = _cache_download_queue_to_disk()

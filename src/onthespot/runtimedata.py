@@ -153,7 +153,7 @@ def increment_failure_count():
     FAILURE_THRESHOLD = 5
 
     if current_count >= FAILURE_THRESHOLD:
-        logger_.error(f"Consecutive failures reached {current_count}, triggering worker restart...")
+        logger_.error(f"🚨 CRITICAL: Consecutive failures reached {current_count}, triggering HARD RESTART...")
 
         # Reset counter before restart to avoid repeated restarts
         reset_failure_count()
@@ -161,6 +161,7 @@ def increment_failure_count():
         # Trigger restart if callback is set
         if worker_restart_callback:
             try:
+                logger_.error("Executing hard restart callback now...")
                 worker_restart_callback()
             except Exception as e:
                 logger_.error(f"Error during worker restart: {e}")
@@ -168,6 +169,12 @@ def increment_failure_count():
             logger_.error("No worker restart callback registered!")
     else:
         logger_.warning(f"Download failure detected ({current_count}/{FAILURE_THRESHOLD})")
+
+
+def get_consecutive_failures():
+    """Get current consecutive failure count"""
+    with consecutive_failures_lock:
+        return consecutive_failures
 
 
 def reset_failure_count():
