@@ -378,15 +378,27 @@ class DownloadWorker(QObject):
                 try:
                     if download_queue:
                         with download_queue_lock:
-                            # Mark item as unavailable for other download workers
-                            iterator = iter(download_queue)
-                            while True:
-                                local_id = next(iterator)
-                                if download_queue[local_id]['available'] is False:
-                                    continue
-                                download_queue[local_id]['available'] = False
-                                item = download_queue[local_id]
-                                break
+                            # Sort queue by album to group album tracks together
+                            # Priority: album_name, track_number, then insertion order
+                            available_items = [
+                                (local_id, item) for local_id, item in download_queue.items()
+                                if item['available'] and item['item_status'] == 'Waiting'
+                            ]
+                            
+                            if not available_items:
+                                time.sleep(0.2)
+                                continue
+                            
+                            # Sort by album name (empty last), then track number
+                            available_items.sort(key=lambda x: (
+                                x[1].get('album_name') or '\uffff',  # Empty albums go last
+                                int(x[1].get('track_number') or 9999),  # Tracks without numbers go last
+                                x[0]  # Maintain insertion order as tiebreaker
+                            ))
+                            
+                            # Get the first available item
+                            local_id, item = available_items[0]
+                            download_queue[local_id]['available'] = False
                     else:
                         time.sleep(0.2)
                         continue
