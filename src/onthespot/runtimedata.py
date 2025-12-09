@@ -34,7 +34,7 @@ download_queue_lock = Lock()
 worker_threads = []
 worker_threads_lock = Lock()
 worker_restart_callback = None  # Function to call to restart workers
-consecutive_failures = 0
+account_consecutive_failures = {}  # Track failures per account index
 consecutive_failures_lock = Lock()
 
 init_tray = False
@@ -141,21 +141,34 @@ def kill_all_workers():
         logger_.info("All workers stopped and cleared")
 
 
-def increment_failure_count():
-    """Increment consecutive failure counter and trigger restart if threshold reached"""
-    global consecutive_failures, worker_restart_callback
+def increment_failure_count(account_index=None):
+    """Increment consecutive failure counter for an account and trigger restart if threshold reached"""
+    global account_consecutive_failures, worker_restart_callback
 
-    with consecutive_failures_lock:
-        consecutive_failures += 1
-        current_count = consecutive_failures
-
-    # Threshold for triggering worker restart
+    # Threshold for triggering worker restart (per account)
     FAILURE_THRESHOLD = 3
 
-    if current_count >= FAILURE_THRESHOLD:
-        logger_.error(f"🚨 CRITICAL: Consecutive failures reached {current_count}, triggering HARD RESTART...")
+    with consecutive_failures_lock:
+        if account_index is None:
+            # If no account specified, increment a global counter
+            account_index = -1
+        
+        if account_index not in account_consecutive_failures:
+            account_consecutive_failures[account_index] = 0
+        
+        account_consecutive_failures[account_index] += 1
+        current_count = account_consecutive_failures[account_index]
+        
+        # Get account info for logging
+        account_info = f"account {account_index}" if account_index >= 0 else "unknown account"
+        if account_index >= 0 and account_index < len(account_pool):
+            account_uuid = account_pool[account_index].get('uuid', 'unknown')
+            account_info = f"account {account_index} ({account_uuid})"
 
-        # Reset counter before restart to avoid repeated restarts
+    if current_count >= FAILURE_THRESHOLD:
+        logger_.error(f"🚨 CRITICAL: Consecutive failures for {account_info} reached {current_count}, triggering HARD RESTART...")
+
+        # Reset all counters before restart to avoid repeated restarts
         reset_failure_count()
 
         # Trigger restart if callback is set
@@ -168,23 +181,37 @@ def increment_failure_count():
         else:
             logger_.error("No worker restart callback registered!")
     else:
-        logger_.warning(f"Download failure detected ({current_count}/{FAILURE_THRESHOLD})")
+        account_info = f"account {account_index}" if account_index >= 0 else "unknown account"
+        if account_index >= 0 and account_index < len(account_pool):
+            account_uuid = account_pool[account_index].get('uuid', 'unknown')
+            account_info = f"account {account_index} ({account_uuid})"
+        logger_.warning(f"Download failure for {account_info} ({current_count}/{FAILURE_THRESHOLD})")
 
 
-def get_consecutive_failures():
-    """Get current consecutive failure count"""
+def get_consecutive_failures(account_index=None):
+    """Get current consecutive failure count for an account"""
     with consecutive_failures_lock:
-        return consecutive_failures
+        if account_index is None:
+            # Return the maximum failure count across all accounts
+            return max(account_consecutive_failures.values()) if account_consecutive_failures else 0
+        return account_consecutive_failures.get(account_index, 0)
 
 
-def reset_failure_count():
+def reset_failure_count(account_index=None):
     """Reset consecutive failure counter (called on successful download)"""
-    global consecutive_failures
+    global account_consecutive_failures
 
     with consecutive_failures_lock:
-        if consecutive_failures > 0:
-            logger_.debug(f"Resetting failure count from {consecutive_failures} to 0")
-        consecutive_failures = 0
+        if account_index is None:
+            # Reset all accounts
+            if account_consecutive_failures:
+                logger_.debug(f"Resetting all failure counts: {account_consecutive_failures}")
+            account_consecutive_failures.clear()
+        else:
+            # Reset specific account
+            if account_index in account_consecutive_failures and account_consecutive_failures[account_index] > 0:
+                logger_.debug(f"Resetting failure count for account {account_index} from {account_consecutive_failures[account_index]} to 0")
+            account_consecutive_failures[account_index] = 0
 
 
 def set_worker_restart_callback(callback):

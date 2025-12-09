@@ -426,6 +426,8 @@ class DownloadWorker(QObject):
                 self.update_progress(item, self.tr("Downloading") if self.gui else "Downloading", 1)
 
                 token = get_account_token(item_service, rotate=config.get("rotate_active_account_number"))
+                # Get account index for failure tracking
+                account_index = self._find_account_index(item_service, token) if token else None
 
                 try:
                     item_metadata = globals()[f"{item_service}_get_{item_type}_metadata"](token, item_id)
@@ -443,7 +445,7 @@ class DownloadWorker(QObject):
                     logger.error(f"Failed to fetch metadata for '{item_id}', Error: {str(e)}\nTraceback: {traceback.format_exc()}")
                     item['item_status'] = "Failed"
                     self.update_progress(item, self.tr("Failed") if self.gui else "Failed", 0)
-                    increment_failure_count()  # Track failure for worker restart
+                    increment_failure_count(account_index)  # Track failure for worker restart
                     self.readd_item_to_download_queue(item)
                     continue
 
@@ -553,7 +555,7 @@ class DownloadWorker(QObject):
                                     self.update_progress(item, self.tr("Already Exists") if self.gui else "Already Exists", 100)
                                 item['item_status'] = 'Already Exists'
                                 logger.info(f"File already exists (found as {entry.name}), Skipping download for track by id '{item_id}'")
-                                reset_failure_count()  # Reset failure counter since file exists
+                                reset_failure_count(account_index)  # Reset failure counter since file exists
                                 time.sleep(0.2)
                                 item['progress'] = 100
                                 self.readd_item_to_download_queue(item)
@@ -1268,8 +1270,8 @@ class DownloadWorker(QObject):
                     # Track failures - session errors count double to trigger restart faster
                     if is_session_error:
                         logger.warning("Session-related error detected, incrementing failure count twice")
-                        increment_failure_count()  # Count twice for session errors
-                    increment_failure_count()
+                        increment_failure_count(account_index)  # Count twice for session errors
+                    increment_failure_count(account_index)
                     
                     self.readd_item_to_download_queue(item)
                     continue
@@ -1362,7 +1364,7 @@ class DownloadWorker(QObject):
                 logger.info("Item Successfully Downloaded")
                 item['progress'] = 100
                 self.update_progress(item, self.tr("Downloaded") if self.gui else "Downloaded", 100)
-                reset_failure_count()  # Reset failure counter on successful download
+                reset_failure_count(account_index)  # Reset failure counter on successful download
                 try:
                     config.set('total_downloaded_data', config.get('total_downloaded_data') + os.path.getsize(item['file_path']))
                     config.set('total_downloaded_items', config.get('total_downloaded_items') + 1)
@@ -1388,8 +1390,8 @@ class DownloadWorker(QObject):
                     # Track failures - session errors count double to trigger restart faster
                     if is_session_error:
                         logger.warning("Session-related error detected, incrementing failure count twice")
-                        increment_failure_count()  # Count twice for session errors
-                    increment_failure_count()
+                        increment_failure_count(account_index)  # Count twice for session errors
+                    increment_failure_count(account_index)
                 else:
                     self.update_progress(item, self.tr("Cancelled") if self.gui else "Cancelled", 0)
 
