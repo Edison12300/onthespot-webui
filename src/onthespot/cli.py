@@ -80,16 +80,11 @@ class QueueWorker(threading.Thread):
 
                             base_path = os.path.join(dl_root, item_path)
 
-                            # Only pre-create playlist entries when output extension is deterministic
+                            # Set file_path for later use (M3U tracking happens after download completes)
                             if not config.get('raw_media_download'):
                                 file_path = build_final_file_path(base_path, item['item_type'], default_format=None, item_service=item['item_service'])
-                                if config.get('create_m3u_file') and item.get('parent_category') == 'playlist':
-                                    temp_item = item.copy()
-                                    temp_item['file_path'] = file_path
-                                    add_to_m3u_file(temp_item, item_metadata)
-                                    m3u_written = True
-                        except Exception as m3u_error:
-                            logging.getLogger("cli").error(f"Failed to prewrite M3U entry for {item.get('item_id')}: {m3u_error}")
+                        except Exception as path_error:
+                            logging.getLogger("cli").error(f"Failed to build file path for {item.get('item_id')}: {path_error}")
 
                         with download_queue_lock:
                             download_queue[local_id] = {

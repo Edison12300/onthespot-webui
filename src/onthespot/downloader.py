@@ -350,7 +350,8 @@ class DownloadWorker(QObject):
 
     def _ensure_playlist_entry(self, item, item_metadata, base_path, default_format, final_path=None):
         """
-        Create the M3U entry early so playlists are complete even if downloads fail.
+        Track completed playlist item for deferred M3U writing.
+        M3U will be written when all playlist items are complete.
         Returns the final file path used for the entry.
         """
         final_path = final_path or build_final_file_path(base_path, item['item_type'], default_format, item_service=item.get('item_service'))
@@ -358,16 +359,8 @@ class DownloadWorker(QObject):
         if not final_path:
             return None
 
-        if config.get('create_m3u_file') and item.get('parent_category') == 'playlist':
-            # Avoid duplicate writes when we retry downloads
-            if not item.get('_m3u_written'):
-                item['file_path'] = final_path
-                try:
-                    add_to_m3u_file(item, item_metadata)
-                    item['_m3u_written'] = True
-                except Exception as m3u_error:
-                    logger.error(f"Failed to add item to M3U file: {str(m3u_error)}\nTraceback: {traceback.format_exc()}")
-                    logger.warning("M3U write failed, but file download was successful and will not be deleted")
+        # Set file_path for tracking
+        item['file_path'] = final_path
 
         return final_path
 
@@ -556,6 +549,14 @@ class DownloadWorker(QObject):
                                 item['item_status'] = 'Already Exists'
                                 logger.info(f"File already exists (found as {entry.name}), Skipping download for track by id '{item_id}'")
                                 reset_failure_count(account_index)  # Reset failure counter since file exists
+                                
+                                # Track completed playlist item (if not already tracked above)
+                                if config.get('create_m3u_file') and item.get('parent_category') == 'playlist' and not item.get('_m3u_written'):
+                                    try:
+                                        add_to_m3u_file(item, item_metadata)
+                                    except Exception as m3u_error:
+                                        logger.error(f"Failed to track existing playlist item for M3U: {str(m3u_error)}")
+                                
                                 time.sleep(0.2)
                                 item['progress'] = 100
                                 self.readd_item_to_download_queue(item)
@@ -1393,6 +1394,14 @@ class DownloadWorker(QObject):
                 item['progress'] = 100
                 self.update_progress(item, self.tr("Downloaded") if self.gui else "Downloaded", 100)
                 reset_failure_count(account_index)  # Reset failure counter on successful download
+                
+                # Track completed playlist item and write M3U if playlist is complete
+                if config.get('create_m3u_file') and item.get('parent_category') == 'playlist':
+                    try:
+                        add_to_m3u_file(item, item_metadata)
+                    except Exception as m3u_error:
+                        logger.error(f"Failed to track playlist item for M3U: {str(m3u_error)}\nTraceback: {traceback.format_exc()}")
+                
                 try:
                     config.set('total_downloaded_data', config.get('total_downloaded_data') + os.path.getsize(item['file_path']))
                     config.set('total_downloaded_items', config.get('total_downloaded_items') + 1)

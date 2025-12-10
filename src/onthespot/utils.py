@@ -748,7 +748,201 @@ def fix_mp3_metadata(filename):
     id3.save()
 
 
+def _get_playlist_cache_path(playlist_name, playlist_by):
+    """Get the path to the playlist completion cache file."""
+    from .otsconfig import cache_dir
+    safe_name = sanitize_data(f"{playlist_name}_{playlist_by}")
+    return os.path.join(cache_dir(), f'playlist_cache_{safe_name}.json')
+
+
+def _load_playlist_cache(playlist_name, playlist_by):
+    """Load completed playlist items from cache."""
+    import json
+    cache_path = _get_playlist_cache_path(playlist_name, playlist_by)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load playlist cache: {e}")
+    return {'completed_items': [], 'total_expected': None}
+
+
+def _save_playlist_cache(playlist_name, playlist_by, cache_data):
+    """Save completed playlist items to cache."""
+    import json
+    from .otsconfig import cache_dir
+    cache_path = _get_playlist_cache_path(playlist_name, playlist_by)
+    os.makedirs(cache_dir(), exist_ok=True)
+    try:
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save playlist cache: {e}")
+
+
+def _add_completed_playlist_item(item, item_metadata):
+    """Track a completed playlist item in cache."""
+    if not item.get('playlist_name'):
+        return
+    
+    cache_data = _load_playlist_cache(item['playlist_name'], item['playlist_by'])
+    
+    # Add this item to completed list (avoid duplicates)
+    item_entry = {
+        'item_id': item.get('item_id'),
+        'file_path': item.get('file_path'),
+        'playlist_number': item.get('playlist_number'),
+        'metadata': {
+            'length': item_metadata.get('length'),
+            'title': item_metadata.get('title'),
+            'artists': item_metadata.get('artists'),
+            'album_name': item_metadata.get('album_name'),
+            'album_artists': item_metadata.get('album_artists'),
+            'album_type': item_metadata.get('album_type'),
+            'release_year': item_metadata.get('release_year'),
+            'disc_number': item_metadata.get('disc_number'),
+            'track_number': item_metadata.get('track_number'),
+            'genre': item_metadata.get('genre'),
+            'label': item_metadata.get('label'),
+            'explicit': item_metadata.get('explicit'),
+            'total_tracks': item_metadata.get('total_tracks'),
+            'total_discs': item_metadata.get('total_discs'),
+            'isrc': item_metadata.get('isrc'),
+        },
+        'item_service': item.get('item_service'),
+        'item_id_full': item.get('item_id')
+    }
+    
+    # Remove any existing entry with same item_id
+    cache_data['completed_items'] = [
+        i for i in cache_data['completed_items'] 
+        if i.get('item_id') != item.get('item_id')
+    ]
+    cache_data['completed_items'].append(item_entry)
+    
+    _save_playlist_cache(item['playlist_name'], item['playlist_by'], cache_data)
+
+
+def _check_and_write_playlist_m3u(playlist_name, playlist_by, download_queue):
+    """Check if playlist is complete and write M3U if so."""
+    if not playlist_name:
+        return False
+    
+    # Count total items in this playlist from download queue
+    from .runtimedata import download_queue_lock
+    with download_queue_lock:
+        playlist_items = [
+            item for item in download_queue.values()
+            if (item.get('parent_category') == 'playlist' and 
+                item.get('playlist_name') == playlist_name and
+                item.get('playlist_by') == playlist_by)
+        ]
+        
+        # Check if all are completed
+        all_complete = all(
+            item.get('item_status') in ('Downloaded', 'Already Exists')
+            for item in playlist_items
+        )
+        
+        if not all_complete:
+            logger.debug(f"Playlist '{playlist_name}' not yet complete")
+            return False
+    
+    # All items complete - write M3U from cache
+    logger.info(f"Playlist '{playlist_name}' complete! Writing M3U file...")
+    cache_data = _load_playlist_cache(playlist_name, playlist_by)
+    
+    if not cache_data['completed_items']:
+        logger.warning(f"No completed items in cache for playlist '{playlist_name}'")
+        return False
+    
+    # Generate M3U file
+    path = config.get("m3u_path_formatter")
+    m3u_file = path.format(
+        playlist_name=sanitize_data(playlist_name),
+        playlist_owner=sanitize_data(playlist_by),
+    )
+    m3u_file += "." + config.get("m3u_format")
+    dl_root = config.get("audio_download_path")
+    m3u_path = os.path.join(dl_root, m3u_file)
+    
+    os.makedirs(os.path.dirname(m3u_path), exist_ok=True)
+    
+    # Sort by playlist_number
+    sorted_items = sorted(
+        cache_data['completed_items'],
+        key=lambda x: int(x.get('playlist_number', 999)) if x.get('playlist_number') else 999
+    )
+    
+    # Write M3U file
+    with open(m3u_path, 'w', encoding='utf-8') as f:
+        f.write("#EXTM3U\n")
+        
+        for item_entry in sorted_items:
+            metadata = item_entry['metadata']
+            
+            EXTINF = config.get('extinf_label').format(
+                service=item_entry.get('item_service', '').title(),
+                service_id=str(item_entry.get('item_id_full', '')),
+                artist=metadata.get('artists', ''),
+                album=metadata.get('album_name', ''),
+                album_artist=metadata.get('album_artists', ''),
+                album_type=metadata.get('album_type', 'single').title(),
+                name=metadata.get('title', ''),
+                year=metadata.get('release_year', ''),
+                disc_number=metadata.get('disc_number', 1) if not config.get('use_double_digit_path_numbers') else str(metadata.get('disc_number', 1)).zfill(2),
+                track_number=metadata.get('track_number', 1) if not config.get('use_double_digit_path_numbers') else str(metadata.get('track_number', 1)).zfill(2),
+                genre=metadata.get('genre', ''),
+                label=metadata.get('label', ''),
+                explicit=str(config.get('explicit_label')) if metadata.get('explicit') else '',
+                trackcount=metadata.get('total_tracks', 1) if not config.get('use_double_digit_path_numbers') else str(metadata.get('total_tracks', 1)).zfill(2),
+                disccount=metadata.get('total_discs', 1) if not config.get('use_double_digit_path_numbers') else str(metadata.get('total_discs', 1)).zfill(2),
+                isrc=str(metadata.get('isrc', '')),
+                playlist_name=playlist_name,
+                playlist_owner=playlist_by,
+                playlist_number=item_entry.get('playlist_number', ''),
+            ).replace(config.get('metadata_separator'), config.get('extinf_separator'))
+            
+            try:
+                ext_length = round(int(metadata.get('length', 0))/1000)
+            except Exception:
+                ext_length = '-1'
+            
+            f.write(f"#EXTINF:{ext_length}, {EXTINF}\n")
+            f.write(f"{item_entry['file_path']}\n")
+    
+    logger.info(f"M3U file written: {m3u_path} ({len(sorted_items)} tracks)")
+    
+    # Clean up cache file
+    try:
+        cache_path = _get_playlist_cache_path(playlist_name, playlist_by)
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+            logger.debug(f"Removed playlist cache: {cache_path}")
+    except Exception as e:
+        logger.error(f"Failed to remove playlist cache: {e}")
+    
+    return True
+
+
 def add_to_m3u_file(item, item_metadata):
+    """Add item to playlist cache and write M3U if playlist is complete."""
+    if not item.get('playlist_name') or item.get('parent_category') != 'playlist':
+        return
+    
+    logger.info(f"Tracking completed playlist item: {item.get('item_id')} for playlist '{item.get('playlist_name')}'")
+    
+    # Add to cache
+    _add_completed_playlist_item(item, item_metadata)
+    
+    # Check if playlist is complete and write M3U if so
+    from .runtimedata import download_queue
+    _check_and_write_playlist_m3u(item.get('playlist_name'), item.get('playlist_by'), download_queue)
+
+
+def legacy_add_to_m3u_file(item, item_metadata):
+    """Original immediate M3U writing (kept for backward compatibility)."""
     logger.info(f"Adding {item['file_path']} to m3u")
 
     path = config.get("m3u_path_formatter")
@@ -812,6 +1006,33 @@ def add_to_m3u_file(item, item_metadata):
         if not already_exists:
             with open(m3u_path, 'a', encoding='utf-8') as m3u_file:
                 m3u_file.write(f"{m3u_item_header}\n{item['file_path']}\n")
+
+
+def force_write_all_playlist_m3us():
+    """Force write M3U files for all cached playlists (useful for cleanup/recovery)."""
+    from .otsconfig import cache_dir
+    from .runtimedata import download_queue
+    import json
+    
+    cache_files = [f for f in os.listdir(cache_dir()) if f.startswith('playlist_cache_') and f.endswith('.json')]
+    
+    for cache_file in cache_files:
+        try:
+            cache_path = os.path.join(cache_dir(), cache_file)
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+            
+            if cache_data.get('completed_items'):
+                # Extract playlist name/by from first item
+                first_item = cache_data['completed_items'][0]
+                playlist_name = first_item.get('metadata', {}).get('playlist_name')
+                playlist_by = first_item.get('metadata', {}).get('playlist_owner')
+                
+                if playlist_name:
+                    logger.info(f"Force writing M3U for cached playlist: {playlist_name}")
+                    _check_and_write_playlist_m3u(playlist_name, playlist_by, download_queue)
+        except Exception as e:
+            logger.error(f"Failed to process playlist cache {cache_file}: {e}")
 
 
 def strip_metadata(item):
