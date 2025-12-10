@@ -1347,8 +1347,8 @@ class DownloadWorker(QObject):
                             if item.get('parent_category') == 'playlist':
                                 item_metadata['album'] = item.get('playlist_name', item_metadata.get('album'))
                                 item_metadata['album_name'] = item.get('playlist_name', item_metadata.get('album'))
-                                item_metadata['compilation'] = '1'
-                                logger.info(f"Playlist track: setting album to '{item_metadata['album']}' and compilation=1")
+                                item_metadata['album_type'] = 'compilation'  # This triggers compilation=1 in embed_metadata
+                                logger.info(f"Playlist track: setting album to '{item_metadata['album']}' and album_type='compilation'")
 
                             embed_metadata(item, item_metadata)
 
