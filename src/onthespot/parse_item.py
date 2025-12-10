@@ -266,6 +266,7 @@ def parsingworker():
                     playlist_name = item.get('playlist_name')
                     playlist_by = item.get('playlist_by')
                     playlist_number = item.get('playlist_number')
+                    playlist_total = item.get('playlist_total')
                     
                     with pending_lock:
                         pending[local_id] = {
@@ -276,7 +277,8 @@ def parsingworker():
                             'parent_category': parent_category,
                             'playlist_name': playlist_name,
                             'playlist_by': playlist_by,
-                            'playlist_number': playlist_number
+                            'playlist_number': playlist_number,
+                            'playlist_total': playlist_total
                             }
                     continue
 
@@ -306,6 +308,7 @@ def parsingworker():
                     if current_service == 'youtube' and not playlist_by:
                         current_type = 'album'
 
+                    total_items = len(track_ids)
                     for index, track_id in enumerate(track_ids):
                         local_id = format_local_id(track_id)
                         with pending_lock:
@@ -317,7 +320,8 @@ def parsingworker():
                                 'parent_category': current_type,
                                 'playlist_name': playlist_name,
                                 'playlist_by': playlist_by,
-                                'playlist_number': str(index + 1)
+                                'playlist_number': str(index + 1),
+                                'playlist_total': total_items
                                 }
                     continue
 

@@ -149,6 +149,24 @@ def format_item_path(item, item_metadata):
     elif item['item_type'] == 'episode':
         path = config.get("show_path_formatter")
 
+    # Calculate dynamic padding for playlist numbers based on total items
+    playlist_number = item.get('playlist_number', '')
+    if playlist_number and item.get('playlist_total'):
+        playlist_total = item.get('playlist_total')
+        # Determine padding width based on total count
+        padding_width = len(str(playlist_total))
+        playlist_number = str(playlist_number).zfill(padding_width)
+    else:
+        playlist_number = sanitize_data(playlist_number)
+    
+    # Calculate dynamic padding for track numbers based on total tracks in album
+    track_number = item_metadata.get('track_number', 1)
+    total_tracks = item_metadata.get('total_tracks', 1)
+    if config.get('use_double_digit_path_numbers'):
+        # Use dynamic padding based on total tracks
+        padding_width = max(2, len(str(total_tracks)))
+        track_number = str(track_number).zfill(padding_width)
+    
     item_path = path.format(
         # Universal
         service=sanitize_data(item.get('item_service')).title(),
@@ -162,16 +180,16 @@ def format_item_path(item, item_metadata):
         album=sanitize_data(album),
         album_artist=sanitize_data(item_metadata.get('album_artists')),
         album_type=item_metadata.get('album_type', 'single').title(),
-        disc_number=item_metadata.get('disc_number', 1) if not config.get('use_double_digit_path_numbers') else str(item_metadata.get('disc_number', 1)).zfill(2),
-        track_number=item_metadata.get('track_number', 1) if not config.get('use_double_digit_path_numbers') else str(item_metadata.get('track_number', 1)).zfill(2),
+        disc_number=item_metadata.get('disc_number', 1) if not config.get('use_double_digit_path_numbers') else str(item_metadata.get('disc_number', 1)).zfill(max(2, len(str(item_metadata.get('total_discs', 1))))),
+        track_number=track_number,
         genre=sanitize_data(item_metadata.get('genre')),
         label=sanitize_data(item_metadata.get('label')),
-        trackcount=item_metadata.get('total_tracks', 1) if not config.get('use_double_digit_path_numbers') else str(item_metadata.get('total_tracks', 1)).zfill(2),
-        disccount=item_metadata.get('total_discs', 1) if not config.get('use_double_digit_path_numbers') else str(item_metadata.get('total_discs', 1)).zfill(2),
+        trackcount=item_metadata.get('total_tracks', 1) if not config.get('use_double_digit_path_numbers') else str(item_metadata.get('total_tracks', 1)).zfill(max(2, len(str(item_metadata.get('total_tracks', 1))))),
+        disccount=item_metadata.get('total_discs', 1) if not config.get('use_double_digit_path_numbers') else str(item_metadata.get('total_discs', 1)).zfill(max(2, len(str(item_metadata.get('total_discs', 1))))),
         isrc=str(item_metadata.get('isrc')),
         playlist_name=sanitize_data(item.get('playlist_name')),
         playlist_owner=sanitize_data(item.get('playlist_by')),
-        playlist_number=sanitize_data(item.get('playlist_number')),
+        playlist_number=playlist_number,
 
         # Show
         show_name=sanitize_data(item_metadata.get('show_name')),

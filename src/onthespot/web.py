@@ -58,7 +58,8 @@ def _cache_download_queue_to_disk():
                 'parent_category': item.get('parent_category'),
                 'playlist_name': item.get('playlist_name'),
                 'playlist_by': item.get('playlist_by'),
-                'playlist_number': item.get('playlist_number')
+                'playlist_number': item.get('playlist_number'),
+                'playlist_total': item.get('playlist_total')
             })
         with open(cached_path, 'w') as file:
             json.dump(items_to_cache, file, indent=2)
@@ -138,6 +139,7 @@ class QueueWorker(threading.Thread):
                                 'playlist_name': item.get('playlist_name'),
                                 'playlist_by': item.get('playlist_by'),
                                 'playlist_number': item.get('playlist_number'),
+                                'playlist_total': item.get('playlist_total'),
                                 'track_number': item_metadata.get('track_number'),
                                 'album_name': item_metadata.get('album_name'),
                                 'item_album_name': item_metadata.get('album_name'),
@@ -944,7 +946,8 @@ def main():
                         'parent_category': item_data.get('parent_category'),
                         'playlist_name': item_data.get('playlist_name'),
                         'playlist_by': item_data.get('playlist_by'),
-                        'playlist_number': item_data.get('playlist_number')
+                        'playlist_number': item_data.get('playlist_number'),
+                        'playlist_total': item_data.get('playlist_total')
                     }
             logger.info(f'Restored {len(cached_items)} items from cached queue')
             os.remove(cached_file_json)

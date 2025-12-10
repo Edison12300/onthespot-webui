@@ -101,6 +101,7 @@ class QueueWorker(threading.Thread):
                                 'playlist_name': item.get('playlist_name'),
                                 'playlist_by': item.get('playlist_by'),
                                 'playlist_number': item.get('playlist_number'),
+                                'playlist_total': item.get('playlist_total'),
                                 '_m3u_written': m3u_written
                                 }
                 else:

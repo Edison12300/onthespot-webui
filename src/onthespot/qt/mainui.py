@@ -573,6 +573,7 @@ class MainWindow(QMainWindow):
                 'playlist_name': playlist_name,
                 'playlist_by': playlist_by,
                 'playlist_number': item.get('playlist_number'),
+                'playlist_total': item.get('playlist_total'),
                 "gui": {
                     "item_label": item_label,
                     "status_label": status_label,
