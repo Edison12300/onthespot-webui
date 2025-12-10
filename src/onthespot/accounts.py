@@ -53,22 +53,30 @@ def get_account_token(item_service, rotate=False):
     if item_service in ('bandcamp', 'youtube_music', 'generic'):
         return
     parsing_index = config.get('active_account_number')
+    
+    # Try the primary account first if not rotating and it's active
     if item_service == account_pool[parsing_index]['service'] and not rotate:
-        # Check if the account is active before returning token
-        if account_pool[parsing_index].get('status') != 'active':
-            logger.error(f"Account at index {parsing_index} is not active (status: {account_pool[parsing_index].get('status')})")
-            return None
-        return globals()[f"{item_service}_get_token"](parsing_index)
-    else:
-        for i in range(parsing_index + 1, parsing_index + len(account_pool) + 1):
-            index = i % len(account_pool)
-            if item_service == account_pool[index]['service']:
-                # Check if the account is active before using it
-                if account_pool[index].get('status') != 'active':
-                    logger.debug(f"Skipping account at index {index} (status: {account_pool[index].get('status')})")
-                    continue
-                if config.get("rotate_active_account_number"):
-                    logger.debug(f"Returning {account_pool[index]['service']} account number {index}: {account_pool[index]['uuid']}")
-                    config.set('active_account_number', index)
-                    config.save()
-                return globals()[f"{item_service}_get_token"](index)
+        if account_pool[parsing_index].get('status') == 'active':
+            return globals()[f"{item_service}_get_token"](parsing_index)
+        else:
+            logger.debug(f"Primary account at index {parsing_index} is not active (status: {account_pool[parsing_index].get('status')}), searching for alternative")
+    
+    # Search for any active account of the requested service
+    for i in range(parsing_index + 1, parsing_index + len(account_pool) + 1):
+        index = i % len(account_pool)
+        if item_service == account_pool[index]['service']:
+            # Check if the account is active before using it
+            if account_pool[index].get('status') != 'active':
+                logger.debug(f"Skipping account at index {index} (status: {account_pool[index].get('status')})")
+                continue
+            if config.get("rotate_active_account_number"):
+                logger.debug(f"Returning {account_pool[index]['service']} account number {index}: {account_pool[index]['uuid']}")
+                config.set('active_account_number', index)
+                config.save()
+            else:
+                logger.info(f"Using alternative {account_pool[index]['service']} account at index {index}: {account_pool[index]['uuid']}")
+            return globals()[f"{item_service}_get_token"](index)
+    
+    # No active account found
+    logger.error(f"No active account found for service: {item_service}")
+    return None
