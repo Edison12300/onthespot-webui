@@ -126,7 +126,7 @@ class QueueWorker(threading.Thread):
                     if item_metadata:
                         # Preserve playlist context from pending item
                         playlist_total = item.get('playlist_total')
-                        logger.debug(f"Transfer to download queue: item {local_id}, playlist_total={playlist_total}")
+                        logger.debug(f"QueueWorker: Processing {local_id}, pending item keys: {list(item.keys())}, playlist_total={playlist_total}, playlist_number={item.get('playlist_number')}")
                         
                         with download_queue_lock:
                             download_queue[local_id] = {
