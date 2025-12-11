@@ -510,49 +510,8 @@ class DownloadWorker(QObject):
                                 entry_base = entry.name
 
                             if entry_base == target_filename:
-                                logger.info(f"MATCH FOUND! File '{entry.name}' matches target '{target_filename}' - Skipping download")
+                                logger.info(f"MATCH FOUND! File '{entry.name}' matches target '{target_filename}' - Skipping download and metadata rewrite")
                                 item['file_path'] = entry.path
-                                if item_type in ['track', 'podcast_episode']:
-                                    if config.get('overwrite_existing_metadata'):
-
-                                        logger.info('Overwriting Existing Metadata')
-
-                                        # Lyrics
-                                        if item_service in ("apple_music", "spotify", "tidal") and config.get('download_lyrics'):
-                                            item['item_status'] = 'Getting Lyrics'
-                                            self.update_progress(item, self.tr("Getting Lyrics") if self.gui else "Getting Lyrics", 99)
-                                            extra_metadata = globals()[f"{item_service}_get_lyrics"](token, item_id, item_type, item_metadata, file_path)
-                                            if isinstance(extra_metadata, dict):
-                                                item_metadata.update(extra_metadata)
-
-                                        if not config.get('raw_media_download'):
-                                            strip_metadata(item)
-                                            
-                                            # Override metadata for playlist tracks
-                                            if item.get('parent_category') == 'playlist':
-                                                item_metadata['album'] = item.get('playlist_name', item_metadata.get('album'))
-                                                item_metadata['album_name'] = item.get('playlist_name', item_metadata.get('album'))
-                                                item_metadata['album_artists'] = 'Various Artists'
-                                                item_metadata['album_type'] = 'compilation'
-                                                item_metadata['disc_number'] = 1
-                                                item_metadata['total_discs'] = 1
-                                                logger.info(f"Playlist track (existing): setting album to '{item_metadata['album']}', album_artist='Various Artists', disc=1/1, and album_type='compilation'")
-                                            
-                                            embed_metadata(item, item_metadata)
-
-                                            # Thumbnail
-                                            if config.get('save_album_cover') or config.get('embed_cover'):
-                                                item['item_status'] = 'Setting Thumbnail'
-                                                self.update_progress(item, self.tr("Setting Thumbnail") if self.gui else "Setting Thumbnail", 99)
-                                                set_music_thumbnail(item['file_path'], item_metadata)
-
-                                            if os.path.splitext(item['file_path'])[1] == '.mp3':
-                                                fix_mp3_metadata(item['file_path'])
-                                        else:
-                                            if config.get('save_album_cover'):
-                                                item['item_status'] = 'Setting Thumbnail'
-                                                self.update_progress(item, self.tr("Setting Thumbnail") if self.gui else "Setting Thumbnail", 99)
-                                                set_music_thumbnail(file_path, item_metadata)
 
                                 # Set status to Already Exists first
                                 if item['item_status'] in ('Downloading', 'Setting Thumbnail', 'Adding To M3U', 'Getting Lyrics'):
