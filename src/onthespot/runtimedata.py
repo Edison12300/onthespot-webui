@@ -52,6 +52,7 @@ worker_restart_lock = Lock()  # Prevent multiple simultaneous restarts
 worker_restart_in_progress = False
 account_consecutive_failures = {}  # Track failures per account index
 consecutive_failures_lock = Lock()
+MAX_FAILURE_TRACKING_SIZE = 100  # Prevent unbounded growth
 
 init_tray = False
 
@@ -186,6 +187,12 @@ def increment_failure_count(account_index=None):
         if account_index is None:
             # If no account specified, increment a global counter
             account_index = -1
+        
+        # Prevent unbounded growth - cleanup if dict gets too large
+        if len(account_consecutive_failures) > MAX_FAILURE_TRACKING_SIZE:
+            logger_.warning(f"Failure tracking dict size ({len(account_consecutive_failures)}) exceeded limit, clearing old entries")
+            # Keep only entries with high failure counts
+            account_consecutive_failures = {k: v for k, v in account_consecutive_failures.items() if v >= 2}
         
         if account_index not in account_consecutive_failures:
             account_consecutive_failures[account_index] = 0

@@ -1,5 +1,5 @@
 from time import sleep
-from PyQt6.QtCore import QThread, pyqtSignal
+import threading
 from .api.apple_music import apple_music_login_user, apple_music_get_token
 from .api.bandcamp import bandcamp_login_user
 from .api.deezer import deezer_login_user, deezer_get_token
@@ -16,14 +16,11 @@ from .runtimedata import get_logger, account_pool
 logger = get_logger("accounts")
 
 
-class FillAccountPool(QThread):
-    finished = pyqtSignal()
-    progress = pyqtSignal(str, bool)
-
-    def __init__(self, gui=False):
-        self.gui = gui
+class FillAccountPool(threading.Thread):
+    def __init__(self, finished_callback=None, progress_callback=None):
         super().__init__()
-
+        self.finished_callback = finished_callback
+        self.progress_callback = progress_callback
 
     def run(self):
         accounts = config.get('accounts')
@@ -32,21 +29,22 @@ class FillAccountPool(QThread):
             if not account['active']:
                 continue
 
-            if self.gui:
-                self.progress.emit(self.tr('Attempting to create session for\n{0}...').format(account['uuid']), True)
+            if self.progress_callback:
+                self.progress_callback(f'Attempting to create session for {account["uuid"]}...', True)
 
             valid_login = globals()[f"{service}_login_user"](account)
             if valid_login:
-                if self.gui:
-                    self.progress.emit(self.tr('Session created for\n{0}!').format(account['uuid']), True)
+                if self.progress_callback:
+                    self.progress_callback(f'Session created for {account["uuid"]}!', True)
                 continue
             else:
-                if self.gui:
-                    self.progress.emit(self.tr('Login failed for \n{0}!').format(account['uuid']), True)
+                if self.progress_callback:
+                    self.progress_callback(f'Login failed for {account["uuid"]}!', True)
                     sleep(0.5)
                 continue
 
-        self.finished.emit()
+        if self.finished_callback:
+            self.finished_callback()
 
 
 def get_account_token(item_service, rotate=False):

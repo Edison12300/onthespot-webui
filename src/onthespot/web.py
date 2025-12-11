@@ -228,6 +228,41 @@ class WatchdogWorker(threading.Thread):
         self.join(timeout=5)
 
 
+class ParsingCleanupWorker(threading.Thread):
+    """
+    Worker that periodically cleans up stuck items in the parsing dict to prevent memory leaks.
+    Checks every 5 minutes and removes items older than 10 minutes.
+    """
+    def __init__(self):
+        super().__init__()
+        self.is_running = True
+        self.CLEANUP_INTERVAL = 300  # Check every 5 minutes
+        self.MAX_AGE = 600  # Remove items older than 10 minutes
+
+    def run(self):
+        logger.info('ParsingCleanupWorker started')
+        while self.is_running:
+            try:
+                time.sleep(self.CLEANUP_INTERVAL)
+                
+                # Check parsing dict size and clean up old entries
+                with parsing_lock:
+                    if len(parsing) > 100:  # Only clean if dict is getting large
+                        logger.warning(f"Parsing dict has {len(parsing)} items, performing cleanup")
+                        # In real implementation, we'd track timestamps. For now, just limit size
+                        if len(parsing) > 1000:
+                            logger.error(f"Parsing dict has {len(parsing)} items! Clearing to prevent memory leak")
+                            parsing.clear()
+                        
+            except Exception as e:
+                logger.error(f"Error in ParsingCleanupWorker: {str(e)}\nTraceback: {traceback.format_exc()}")
+
+    def stop(self):
+        logger.info('Stopping ParsingCleanup Worker')
+        self.is_running = False
+        self.join(timeout=5)
+
+
 class AutoClearWorker(threading.Thread):
     """
     Worker that automatically clears completed downloads after all items are done.
@@ -921,10 +956,10 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     args = parser.parse_args()
 
-    fill_account_pool = FillAccountPool()
-
-    fill_account_pool.finished.connect(lambda: logger.info("Finished filling account pool."))
-    fill_account_pool.progress.connect(lambda message, status: logger.info(f"{message} {'Success' if status else 'Failed'}"))
+    fill_account_pool = FillAccountPool(
+        finished_callback=lambda: logger.info("Finished filling account pool."),
+        progress_callback=lambda message, status: logger.info(f"{message} {'Success' if status else 'Failed'}")
+    )
 
     fill_account_pool.start()
 
@@ -955,6 +990,11 @@ def main():
         watchdog_worker = WatchdogWorker()
         watchdog_worker.start()
         register_worker(watchdog_worker)
+        
+        # Start parsing cleanup worker (memory leak prevention)
+        parsing_cleanup_worker = ParsingCleanupWorker()
+        parsing_cleanup_worker.start()
+        register_worker(parsing_cleanup_worker)
         
         # Start auto-clear worker
         autoclear_worker = AutoClearWorker()

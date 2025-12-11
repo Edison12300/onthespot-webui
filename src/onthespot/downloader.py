@@ -7,7 +7,6 @@ import time
 import traceback
 import os
 import queue
-from PyQt6.QtCore import QObject, pyqtSignal
 from librespot.audio.decoders import AudioQuality, VorbisOnlyAudioQuality
 from librespot.metadata import TrackId, EpisodeId
 from yt_dlp import YoutubeDL
@@ -67,11 +66,8 @@ def build_final_file_path(base_path, item_type, default_format, item_service=Non
     return base_path
 
 
-class RetryWorker(QObject):
-    progress = pyqtSignal(dict, str, int)
-    def __init__(self, gui=False):
-        super().__init__()
-        self.gui = gui
+class RetryWorker:
+    def __init__(self):
         self.thread = threading.Thread(target=self.run)
         self.is_running = True
 
@@ -128,10 +124,6 @@ class RetryWorker(QObject):
                         if download_queue[local_id]['item_status'] == "Failed":
                             logger.debug(f'Retrying : {local_id}')
                             download_queue[local_id]['item_status'] = "Waiting"
-                            if self.gui:
-                                download_queue[local_id]['gui']['status_label'].setText(self.tr("Waiting"))
-                                download_queue[local_id]['gui']["btn"]['cancel'].show()
-                                download_queue[local_id]['gui']["btn"]['retry'].hide()
             if config.get('retry_worker_delay') > 0:
                 time.sleep(config.get('retry_worker_delay') * 60)
             continue
@@ -143,11 +135,8 @@ class RetryWorker(QObject):
         self.thread.join()
 
 
-class DownloadWorker(QObject):
-    progress = pyqtSignal(dict, str, int)
-    def __init__(self, gui=False):
-        super().__init__()
-        self.gui = gui
+class DownloadWorker:
+    def __init__(self):
         self.thread = threading.Thread(target=self.run)
         self.is_running = True
 
@@ -158,21 +147,20 @@ class DownloadWorker(QObject):
 
 
     def readd_item_to_download_queue(self, item):
+        """Re-add item to download queue - optimized to avoid delete/recreate"""
         with download_queue_lock:
             try:
                 local_id = item['local_id']
-                del download_queue[local_id]
-                download_queue[local_id] = item
-                download_queue[local_id]['available'] = True
+                # Just mark as available instead of delete-recreate
+                if local_id in download_queue:
+                    download_queue[local_id]['available'] = True
             except (KeyError):
                 # Item likely cleared from queue
                 return
 
 
     def update_progress(self, item, status, progress_value):
-        """Update progress for both GUI and web interface"""
-        if self.gui:
-            self.progress.emit(item, status, progress_value)
+        """Update progress for web interface"""
         # Always update the item's progress for web interface
         item['progress'] = progress_value
 
@@ -183,7 +171,7 @@ class DownloadWorker(QObject):
         if progress_str:
             updated_progress_value = round(float(progress_str.group(1))) - 1
             if updated_progress_value >= progress:
-                self.update_progress(item, self.tr("Downloading") if self.gui else "Downloading", updated_progress_value)
+                self.update_progress(item, "Downloading", updated_progress_value)
         if item['item_status'] == 'Cancelled':
             raise Exception("Download cancelled by user.")
 
@@ -436,7 +424,7 @@ class DownloadWorker(QObject):
                     continue
 
                 item['item_status'] = "Downloading"
-                self.update_progress(item, self.tr("Downloading") if self.gui else "Downloading", 1)
+                self.update_progress(item, "Downloading", 1)
 
                 token = get_account_token(item_service, rotate=config.get("rotate_active_account_number"))
                 # Get account index for failure tracking
@@ -457,7 +445,7 @@ class DownloadWorker(QObject):
                 except (Exception, KeyError) as e:
                     logger.error(f"Failed to fetch metadata for '{item_id}', Error: {str(e)}\nTraceback: {traceback.format_exc()}")
                     item['item_status'] = "Failed"
-                    self.update_progress(item, self.tr("Failed") if self.gui else "Failed", 0)
+                    self.update_progress(item, "Failed", 0)
                     increment_failure_count(account_index)  # Track failure for worker restart
                     self.readd_item_to_download_queue(item)
                     continue
@@ -525,7 +513,7 @@ class DownloadWorker(QObject):
 
                                 # Set status to Already Exists first
                                 if item['item_status'] in ('Downloading', 'Setting Thumbnail', 'Adding To M3U', 'Getting Lyrics'):
-                                    self.update_progress(item, self.tr("Already Exists") if self.gui else "Already Exists", 100)
+                                    self.update_progress(item, "Already Exists", 100)
                                 item['item_status'] = 'Already Exists'
                                 
                                 # M3U - track after status is set
@@ -557,7 +545,7 @@ class DownloadWorker(QObject):
                 if not item_metadata['is_playable']:
                     logger.error(f"Track is unavailable, track id '{item_id}'")
                     item['item_status'] = 'Unavailable'
-                    self.update_progress(item, self.tr("Unavailable") if self.gui else "Unavailable", 0)
+                    self.update_progress(item, "Unavailable", 0)
                     self.readd_item_to_download_queue(item)
                     continue
 
@@ -665,7 +653,7 @@ class DownloadWorker(QObject):
                                             downloaded += len(data)
                                             file.write(data)
                                             progress_pct = int((downloaded / total_size) * 100)
-                                            self.update_progress(item, self.tr("Downloading") if self.gui else "Downloading", progress_pct)
+                                            self.update_progress(item, "Downloading", progress_pct)
                                             last_progress_time = time.time()
                                             consecutive_empty_reads = 0  # Reset on successful read
                                         else:
@@ -888,12 +876,12 @@ class DownloadWorker(QObject):
                                             if item['item_status'] == 'Cancelled':
                                                 raise Exception("Download cancelled by user.")
                                             progress_pct = int((downloaded / total_size) * 100)
-                                            self.update_progress(item, self.tr("Downloading") if self.gui else "Downloading", progress_pct)
+                                            self.update_progress(item, "Downloading", progress_pct)
                                             last_progress_time = time.time()  # Update progress time when data received
 
                                     key = calcbfkey(song["SNG_ID"])
 
-                                    self.update_progress(item, self.tr("Decrypting") if self.gui else "Decrypting", 99)
+                                    self.update_progress(item, "Decrypting", 99)
                                     with open(temp_file_path, "wb") as fo:
                                         decryptfile(data_chunks, key, fo)
                                         # Ensure all data is flushed to disk before closing
@@ -906,7 +894,7 @@ class DownloadWorker(QObject):
                                 else:
                                     logger.info(f"Deezer download attempts failed: {file.status_code}")
                                     item['item_status'] = "Failed"
-                                    self.update_progress(item, self.tr("Failed") if self.gui else "Failed", 0)
+                                    self.update_progress(item, "Failed", 0)
                                     self.readd_item_to_download_queue(item)
                                     break
 
@@ -1014,7 +1002,7 @@ class DownloadWorker(QObject):
                                                 if item['item_status'] == 'Cancelled':
                                                     raise Exception("Download cancelled by user.")
                                                 progress_pct = int((downloaded / total_size) * 100)
-                                                self.update_progress(item, self.tr("Downloading") if self.gui else "Downloading", progress_pct)
+                                                self.update_progress(item, "Downloading", progress_pct)
                                                 last_progress_time = time.time()  # Update progress time when data received
 
                                     # Ensure all data is flushed to disk before closing
@@ -1095,7 +1083,7 @@ class DownloadWorker(QObject):
                         with YoutubeDL(ydl_opts) as video:
                             video.download(stream_url)
 
-                        self.update_progress(item, self.tr("Decrypting") if self.gui else "Decrypting", 99)
+                        self.update_progress(item, "Decrypting", 99)
 
                         decrypted_temp_file_path = temp_file_path + '.m4a'
                         command = [
@@ -1148,7 +1136,7 @@ class DownloadWorker(QObject):
                                 ydl_opts['http_headers'] = headers
                                 ydl_opts['outtmpl'] = temp_file_path + f' - {version["audio_locale"]}.%(ext)s.%(ext)s'
 
-                                self.update_progress(item, self.tr("Downloading Video") if self.gui else "Downloading Video", 1)
+                                self.update_progress(item, "Downloading Video", 1)
                                 ydl_video_opts = ydl_opts
                                 ydl_video_opts['format'] = (f'(bestvideo[height<={config.get("preferred_video_resolution")}][ext=mp4]/bestvideo)')
                                 with YoutubeDL(ydl_video_opts) as video:
@@ -1164,7 +1152,7 @@ class DownloadWorker(QObject):
                                 headers['Authorization'] = f'Bearer {token}'
                                 ydl_opts['http_headers'] = headers
 
-                                self.update_progress(item, self.tr("Downloading Audio") if self.gui else "Downloading Audio", 1)
+                                self.update_progress(item, "Downloading Audio", 1)
                                 ydl_audio_opts = ydl_opts
                                 ydl_audio_opts['format'] = ('(bestaudio[ext=m4a]/bestaudio)')
                                 with YoutubeDL(ydl_audio_opts) as audio:
@@ -1180,7 +1168,7 @@ class DownloadWorker(QObject):
 
                                 # Download Chapters
                                 if not config.get('raw_media_download') and config.get('download_chapters'):
-                                    self.update_progress(item, self.tr("Downloading Chapters") if self.gui else "Downloading Chapters", 1)
+                                    self.update_progress(item, "Downloading Chapters", 1)
                                     chapter_file = temp_file_path + f' - {version["audio_locale"]}.txt'
                                     if not os.path.exists(chapter_file):
                                         stall_timeout = config.get("download_stall_timeout")
@@ -1199,7 +1187,7 @@ class DownloadWorker(QObject):
                                                 'language': version['audio_locale']
                                             })
 
-                        self.update_progress(item, self.tr("Decrypting") if self.gui else "Decrypting", 99)
+                        self.update_progress(item, "Decrypting", 99)
 
                         for encrypted_file in encrypted_files:
                             decrypted_temp_file_path = os.path.splitext(encrypted_file['path'])[0]
@@ -1232,7 +1220,7 @@ class DownloadWorker(QObject):
                         # Download Subtitles
                         if config.get("download_subtitles"):
                             item['item_status'] = 'Downloading Subtitles'
-                            self.update_progress(item, self.tr("Downloading Subtitles") if self.gui else "Downloading Subtitles", 99)
+                            self.update_progress(item, "Downloading Subtitles", 99)
 
                             finished_sub_langs = []
                             for subtitle_format in subtitle_formats:
@@ -1283,7 +1271,7 @@ class DownloadWorker(QObject):
                     
                     logger.info(f"Download failed: {item}, Error: {str(e)}\nTraceback: {traceback.format_exc()}")
                     item['item_status'] = 'Failed'
-                    self.update_progress(item, self.tr("Failed") if self.gui else "Failed", 0)
+                    self.update_progress(item, "Failed", 0)
                     
                     # Track failures - session errors count double to trigger restart faster
                     if is_session_error:
@@ -1301,7 +1289,7 @@ class DownloadWorker(QObject):
                         # Lyrics
                         if item_service in ("apple_music", "spotify", "tidal") and config.get('download_lyrics'):
                             item['item_status'] = 'Getting Lyrics'
-                            self.update_progress(item, self.tr("Getting Lyrics") if self.gui else "Getting Lyrics", 99)
+                            self.update_progress(item, "Getting Lyrics", 99)
                             extra_metadata = globals()[f"{item_service}_get_lyrics"](token, item_id, item_type, item_metadata, file_path)
                             if isinstance(extra_metadata, dict):
                                 item_metadata.update(extra_metadata)
@@ -1327,7 +1315,7 @@ class DownloadWorker(QObject):
                         # Convert file format and embed metadata
                         if not config.get('raw_media_download'):
                             item['item_status'] = 'Converting'
-                            self.update_progress(item, self.tr("Converting") if self.gui else "Converting", 99)
+                            self.update_progress(item, "Converting", 99)
 
                             if config.get('use_custom_file_bitrate'):
                                 bitrate = config.get("file_bitrate")
@@ -1348,7 +1336,7 @@ class DownloadWorker(QObject):
                             # Thumbnail
                             if config.get('save_album_cover') or config.get('embed_cover'):
                                 item['item_status'] = 'Setting Thumbnail'
-                                self.update_progress(item, self.tr("Setting Thumbnail") if self.gui else "Setting Thumbnail", 99)
+                                self.update_progress(item, "Setting Thumbnail", 99)
                                 set_music_thumbnail(file_path, item_metadata)
 
                             if os.path.splitext(file_path)[1] == '.mp3':
@@ -1356,13 +1344,13 @@ class DownloadWorker(QObject):
                         else:
                             if config.get('save_album_cover'):
                                 item['item_status'] = 'Setting Thumbnail'
-                                self.update_progress(item, self.tr("Setting Thumbnail") if self.gui else "Setting Thumbnail", 99)
+                                self.update_progress(item, "Setting Thumbnail", 99)
                                 set_music_thumbnail(file_path, item_metadata)
 
                         # M3U
                         if config.get('create_m3u_file') and item.get('parent_category') == 'playlist' and not item.get('_m3u_written'):
                             item['item_status'] = 'Adding To M3U'
-                            self.update_progress(item, self.tr("Adding To M3U") if self.gui else "Adding To M3U", 99)
+                            self.update_progress(item, "Adding To M3U", 99)
                             final_file_path = self._ensure_playlist_entry(item, item_metadata, file_path, default_format, final_file_path)
 
                     # Video Formatting
@@ -1378,7 +1366,7 @@ class DownloadWorker(QObject):
 
                         if not config.get("raw_media_download"):
                             item['item_status'] = 'Converting'
-                            self.update_progress(item, self.tr("Converting") if self.gui else "Converting", 99)
+                            self.update_progress(item, "Converting", 99)
                             if item_type == "episode":
                                 output_format = config.get("show_file_format")
                             elif item_type == "movie":
@@ -1391,7 +1379,7 @@ class DownloadWorker(QObject):
                 item['item_status'] = 'Downloaded'
                 logger.info("Item Successfully Downloaded")
                 item['progress'] = 100
-                self.update_progress(item, self.tr("Downloaded") if self.gui else "Downloaded", 100)
+                self.update_progress(item, "Downloaded", 100)
                 reset_failure_count(account_index)  # Reset failure counter on successful download
                 
                 # Track completed playlist item and write M3U if playlist is complete
@@ -1421,7 +1409,7 @@ class DownloadWorker(QObject):
                 logger.error(f"Unknown Exception: {str(e)}\nTraceback: {traceback.format_exc()}")
                 if item['item_status'] != "Cancelled":
                     item['item_status'] = "Failed"
-                    self.update_progress(item, self.tr("Failed") if self.gui else "Failed", 0)
+                    self.update_progress(item, "Failed", 0)
                     
                     # Track failures - session errors count double to trigger restart faster
                     if is_session_error:
@@ -1429,7 +1417,7 @@ class DownloadWorker(QObject):
                         increment_failure_count(account_index)  # Count twice for session errors
                     increment_failure_count(account_index)
                 else:
-                    self.update_progress(item, self.tr("Cancelled") if self.gui else "Cancelled", 0)
+                    self.update_progress(item, "Cancelled", 0)
 
                 time.sleep(config.get("download_delay"))
                 self.readd_item_to_download_queue(item)
