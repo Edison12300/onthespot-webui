@@ -222,14 +222,14 @@ def increment_failure_count(account_index=None):
                     worker_restart_callback()
                 except Exception as e:
                     logger_.error(f"Failed to restart workers: {e}\nTraceback: {traceback.format_exc()}")
+            else:
+                logger_.error("No worker restart callback registered!")
         finally:
             # Clear restart flag after some time
             import time
             time.sleep(5)  # Give restart time to complete
             with worker_restart_lock:
                 worker_restart_in_progress = False
-        else:
-            logger_.error("No worker restart callback registered!")
     else:
         account_info = f"account {account_index}" if account_index >= 0 else "unknown account"
         if account_index >= 0 and account_index < len(account_pool):
