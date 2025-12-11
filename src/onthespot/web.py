@@ -744,7 +744,17 @@ def restart():
 @login_required
 def get_items():
     with download_queue_lock:
-        return Response(json.dumps(download_queue, sort_keys=True), mimetype='application/json')
+        # Sort items by album, then by track number within each album
+        sorted_items = sorted(
+            download_queue.items(),
+            key=lambda x: (
+                x[1].get('album', ''),  # Primary sort by album name
+                x[1].get('track_number', 0) if isinstance(x[1].get('track_number'), int) else 0  # Secondary sort by track number
+            )
+        )
+        # Convert back to dictionary maintaining sort order
+        sorted_queue = {k: v for k, v in sorted_items}
+        return Response(json.dumps(sorted_queue), mimetype='application/json')
 
 @app.route('/api/cancel/<path:local_id>', methods=['POST'])
 @login_required
