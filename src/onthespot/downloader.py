@@ -24,6 +24,7 @@ from .api.crunchyroll import crunchyroll_get_episode_metadata, crunchyroll_get_d
 from .api.generic import generic_get_track_metadata
 from .otsconfig import config
 from .runtimedata import get_logger, download_queue, download_queue_lock, account_pool, temp_download_path, increment_failure_count, reset_failure_count
+from . import runtimedata
 from .utils import format_item_path, convert_audio_format, embed_metadata, set_music_thumbnail, fix_mp3_metadata, add_to_m3u_file, strip_metadata, convert_video_format
 
 logger = get_logger("downloader")
@@ -369,6 +370,14 @@ class DownloadWorker(QObject):
         while self.is_running:
             try:
                 try:
+                    # Wait if QueueWorker is batch processing items into download queue
+                    with runtimedata.batch_queue_processing_lock:
+                        is_batch_processing = runtimedata.batch_queue_processing
+                    
+                    if is_batch_processing:
+                        time.sleep(0.2)
+                        continue
+                    
                     if download_queue:
                         with download_queue_lock:
                             # Sort queue by album to group album tracks together

@@ -34,6 +34,10 @@ download_queue_lock = Lock()
 batch_parse_in_progress = False
 batch_parse_lock = Lock()
 
+# Batch queue processing state (when QueueWorker is adding many items to download queue)
+batch_queue_processing = False
+batch_queue_processing_lock = Lock()
+
 # Worker management
 worker_threads = []
 worker_threads_lock = Lock()

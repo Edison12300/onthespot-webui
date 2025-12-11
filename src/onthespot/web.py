@@ -131,6 +131,10 @@ class QueueWorker(threading.Thread):
                     continue
                 
                 if pending:
+                    # Set flag to prevent downloads during batch processing
+                    with runtimedata.batch_queue_processing_lock:
+                        runtimedata.batch_queue_processing = True
+                    
                     # Process all pending items at once
                     with pending_lock:
                         items_to_process = list(pending.items())
@@ -177,6 +181,10 @@ class QueueWorker(threading.Thread):
                                 pending[local_id] = item
                     
                     logger.info(f"QueueWorker finished processing batch, {len(download_queue)} items now in download queue")
+                    
+                    # Clear flag to allow downloads to start
+                    with runtimedata.batch_queue_processing_lock:
+                        runtimedata.batch_queue_processing = False
                 else:
                     time.sleep(0.2)
             except Exception as e:
