@@ -215,15 +215,15 @@ def increment_failure_count(account_index=None):
             # Reset all counters before restart to avoid repeated restarts
             reset_failure_count()
 
-            # Trigger restart if callback is set
-            if worker_restart_callback:
+            # Trigger hard restart if callback is set
+            if watchdog_restart_callback:
                 try:
                     logger_.error("Executing hard restart callback now...")
-                    worker_restart_callback()
+                    watchdog_restart_callback()
                 except Exception as e:
                     logger_.error(f"Failed to restart workers: {e}\nTraceback: {traceback.format_exc()}")
             else:
-                logger_.error("No worker restart callback registered!")
+                logger_.error("No watchdog restart callback registered!")
         finally:
             # Clear restart flag after some time
             import time
