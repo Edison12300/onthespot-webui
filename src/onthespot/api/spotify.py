@@ -437,10 +437,13 @@ def spotify_get_playlist_data(token, playlist_id, _retry=False):
         return spotify_get_playlist_data(new_token, playlist_id, _retry=True)
 
     resp = make_call(f'{BASE_URL}/playlists/{playlist_id}', headers=headers, skip_cache=True)
-    # Get highest quality playlist image
+    # Get highest quality playlist image (first image is highest quality)
     image_url = ''
     if resp.get('images') and len(resp['images']) > 0:
         image_url = resp['images'][0].get('url', '')
+        logger.info(f"Playlist image URL: {image_url}")
+    else:
+        logger.warning(f"No playlist images found for playlist {playlist_id}")
     return resp['name'], resp['owner']['display_name'], image_url
 
 

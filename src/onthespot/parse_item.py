@@ -236,7 +236,7 @@ def parsingworker():
                                 cover_path = os.path.join(full_playlist_dir, 'cover.jpg')
                                 if not os.path.exists(cover_path):
                                     try:
-                                        logger.info(f"Downloading playlist cover: {playlist_name}")
+                                        logger.info(f"Downloading playlist cover for '{playlist_name}' from URL: {playlist_image_url}")
                                         img = Image.open(BytesIO(requests.get(playlist_image_url).content))
                                         if img.mode != 'RGB':
                                             img = img.convert('RGB')
