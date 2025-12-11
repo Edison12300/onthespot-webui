@@ -437,7 +437,11 @@ def spotify_get_playlist_data(token, playlist_id, _retry=False):
         return spotify_get_playlist_data(new_token, playlist_id, _retry=True)
 
     resp = make_call(f'{BASE_URL}/playlists/{playlist_id}', headers=headers, skip_cache=True)
-    return resp['name'], resp['owner']['display_name']
+    # Get highest quality playlist image
+    image_url = ''
+    if resp.get('images') and len(resp['images']) > 0:
+        image_url = resp['images'][0].get('url', '')
+    return resp['name'], resp['owner']['display_name'], image_url
 
 
 def spotify_get_lyrics(token, item_id, item_type, metadata, filepath, _retry=False):

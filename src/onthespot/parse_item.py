@@ -193,9 +193,47 @@ def parsingworker():
                         try:
                             logger.info(f"Starting to parse playlist: {current_id}")
                             items = spotify_get_playlist_items(token, current_id)
-                            playlist_name, playlist_by = spotify_get_playlist_data(token, current_id)
+                            playlist_name, playlist_by, playlist_image_url = spotify_get_playlist_data(token, current_id)
                             total_items = len(items)
                             logger.info(f"Playlist '{playlist_name}' has {total_items} items, adding to pending queue...")
+                            
+                            # Save playlist cover.jpg upfront before downloading tracks
+                            if playlist_image_url and config.get('save_album_cover'):
+                                from .utils import format_item_path, sanitize_data
+                                import requests
+                                from PIL import Image
+                                from io import BytesIO
+                                import os
+                                
+                                # Build playlist directory path
+                                playlist_path_template = config.get('playlist_path_formatter')
+                                playlist_vars = {
+                                    'playlist_name': playlist_name,
+                                    'playlist_owner': playlist_by,
+                                    'playlist_by': playlist_by
+                                }
+                                playlist_dir = playlist_path_template.format(**playlist_vars)
+                                # Sanitize
+                                playlist_dir = sanitize_data(playlist_dir, True)
+                                
+                                # Get full path
+                                dl_root = config.get('audio_download_path')
+                                full_playlist_dir = os.path.join(dl_root, playlist_dir)
+                                os.makedirs(full_playlist_dir, exist_ok=True)
+                                
+                                cover_path = os.path.join(full_playlist_dir, 'cover.jpg')
+                                if not os.path.exists(cover_path):
+                                    try:
+                                        logger.info(f"Downloading playlist cover: {playlist_name}")
+                                        img = Image.open(BytesIO(requests.get(playlist_image_url).content))
+                                        if img.mode != 'RGB':
+                                            img = img.convert('RGB')
+                                        img.save(cover_path, format='JPEG')
+                                        logger.info(f"Saved playlist cover: {cover_path}")
+                                    except Exception as e:
+                                        logger.error(f"Failed to save playlist cover: {e}")
+                                else:
+                                    logger.info(f"Playlist cover already exists: {cover_path}")
                             for index, item in enumerate(items):
                                 try:
                                     item_id = item['track']['id']
