@@ -744,12 +744,12 @@ def restart():
 @login_required
 def get_items():
     with download_queue_lock:
-        # Sort items by album, then by track number within each album
+        # Sort items by album name, then by track number within each album
         sorted_items = sorted(
             download_queue.items(),
             key=lambda x: (
-                x[1].get('album', ''),  # Primary sort by album name
-                x[1].get('track_number', 0) if isinstance(x[1].get('track_number'), int) else 0  # Secondary sort by track number
+                x[1].get('album_name', ''),  # Primary sort by album name
+                int(x[1].get('track_number', 0)) if x[1].get('track_number') else 0  # Secondary sort by track number
             )
         )
         # Convert back to dictionary maintaining sort order
