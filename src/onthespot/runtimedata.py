@@ -41,7 +41,7 @@ batch_queue_processing_lock = Lock()
 batch_queue_processing_start_time = None  # Track when flag was set
 
 # Timeout for batch operations (in seconds)
-BATCH_OPERATION_TIMEOUT = 300  # 5 minutes
+BATCH_OPERATION_TIMEOUT = 60  # 1 minute
 
 # Worker management
 worker_threads = []
