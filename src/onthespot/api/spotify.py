@@ -684,7 +684,7 @@ def spotify_get_album_track_ids(token, album_id, _retry=False):
             # Retry with the new token
             return spotify_get_album_track_ids(new_token, album_id, _retry=True)
 
-        resp = make_call(url, headers=headers)
+        resp = make_call(url, headers=headers, skip_cache=True)
 
         offset += limit
         tracks.extend(resp['items'])
