@@ -425,6 +425,8 @@ class DownloadWorker:
 
                 item['item_status'] = "Downloading"
                 self.update_progress(item, "Downloading", 1)
+                
+                logger.info(f"Starting download for track ID: {item_id} from service: {item_service}")
 
                 token = get_account_token(item_service, rotate=config.get("rotate_active_account_number"))
                 # Get account index for failure tracking

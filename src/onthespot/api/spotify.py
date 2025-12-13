@@ -696,6 +696,7 @@ def spotify_get_album_track_ids(token, album_id, _retry=False):
     for track in tracks:
         if track:
             item_ids.append(track['id'])
+    logger.info(f"Album {album_id} has {len(item_ids)} tracks with IDs: {item_ids[:5]}{'...' if len(item_ids) > 5 else ''}")
     return item_ids
 
 
@@ -932,9 +933,11 @@ def spotify_get_track_metadata(token, item_id, _retry=False):
         for i, track_id in enumerate(album_track_ids):
             if track_id == str(item_id):
                 track_number = i + 1
+                logger.info(f"Track {item_id} found at position {track_number} in album track list")
                 break
     if not track_number:
         track_number = track_data.get('tracks', [{}])[0].get('track_number')
+        logger.warning(f"Track {item_id} not found in album track list, using API track_number: {track_number}")
 
     info = {}
     info['artists'] = artists
