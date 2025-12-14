@@ -163,6 +163,8 @@ class DownloadWorker:
         """Update progress for web interface"""
         # Always update the item's progress for web interface
         item['progress'] = progress_value
+        # Track last update time for watchdog
+        item['last_update_time'] = time.time()
 
 
     def yt_dlp_progress_hook(self, item, d):
@@ -357,6 +359,9 @@ class DownloadWorker:
     def run(self):
         last_heartbeat = time.time()
         heartbeat_interval = 60  # Log every 60 seconds
+        last_watchdog_check = time.time()
+        watchdog_interval = 120  # Check for stuck downloads every 2 minutes
+        stuck_timeout = 300  # Consider a download stuck after 5 minutes
         
         while self.is_running:
             try:
@@ -366,6 +371,22 @@ class DownloadWorker:
                         is_processing = runtimedata.batch_queue_processing
                     logger.info(f"DownloadWorker heartbeat: batch_processing={is_processing}, queue_size={len(download_queue)}")
                     last_heartbeat = time.time()
+                
+                # Watchdog: Check for stuck downloads
+                if time.time() - last_watchdog_check > watchdog_interval:
+                    with download_queue_lock:
+                        current_time = time.time()
+                        for local_id, item in download_queue.items():
+                            # Check if item has been in "Downloading" state for too long
+                            if item['item_status'] == 'Downloading':
+                                # Use last_update_time if available, otherwise fall back to checking progress
+                                last_update = item.get('last_update_time', 0)
+                                if current_time - last_update > stuck_timeout:
+                                    logger.warning(f"Watchdog detected stuck download: {item.get('item_name', 'Unknown')} (stuck for {int(current_time - last_update)}s), resetting to Waiting...")
+                                    item['item_status'] = 'Waiting'
+                                    item['available'] = True
+                                    item['progress'] = 0
+                    last_watchdog_check = time.time()
                 
                 try:
                     # Wait if QueueWorker is batch processing items into download queue

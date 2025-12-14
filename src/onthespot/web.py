@@ -199,7 +199,8 @@ class QueueWorker(threading.Thread):
                                         'item_album_name': item_metadata.get('album_name'),
                                         'item_thumbnail': item_metadata["image_url"],
                                         'item_url': item_metadata["item_url"],
-                                        'progress': 0
+                                        'progress': 0,
+                                        'last_update_time': time.time()
                                     }
                         except Exception as e:
                             logger.error(f"Error processing {local_id}: {str(e)}\nTraceback: {traceback.format_exc()}")
