@@ -55,18 +55,38 @@ def make_call(url, params=None, headers=None, session=None, skip_cache=False, te
         ctx.verify_mode = ssl.CERT_REQUIRED
         session.mount('https://', SSLAdapter(ssl_context=ctx))
 
-    response = session.get(url, headers=headers, params=params)
+    max_attempts = config.get('api_retry_max_attempts', 3)
+    default_delay = config.get('api_retry_default_delay', 1)
 
-    if response.status_code == 200:
-        if not skip_cache:
-            with open(req_cache_file, 'w', encoding='utf-8') as cf:
-                cf.write(response.text)
-        if text:
-            return response.text
-        return json.loads(response.text)
-    else:
+    for attempt in range(max_attempts):
+        response = session.get(url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            if not skip_cache:
+                with open(req_cache_file, 'w', encoding='utf-8') as cf:
+                    cf.write(response.text)
+            if text:
+                return response.text
+            return json.loads(response.text)
+
+        if response.status_code == 429:
+            retry_after = response.headers.get('Retry-After')
+            try:
+                wait_seconds = int(retry_after) if retry_after is not None else default_delay
+            except ValueError:
+                wait_seconds = default_delay
+            logger.warning(
+                f"Rate limited (429) for {url}. Retrying in {wait_seconds}s "
+                f"(attempt {attempt + 1}/{max_attempts})."
+            )
+            time.sleep(max(0, wait_seconds))
+            continue
+
         logger.info(f"Request status error {response.status_code}: {url}")
         return None
+
+    logger.error(f"Rate limit exceeded. Max retries ({max_attempts}) exhausted for {url}")
+    return None
 
 
 def format_local_id(item_id):

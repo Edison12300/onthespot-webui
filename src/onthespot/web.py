@@ -766,6 +766,16 @@ def search_results():
             'message': 'You need to login to at least one account to use this feature.',
             'results': []
         })
+    elif isinstance(results, dict) and results.get('error'):
+        retry_after = results.get('retry_after')
+        message = results.get('error', 'Search failed.')
+        if retry_after:
+            message = f"{message} Retry after {retry_after}s."
+        return jsonify({
+            'success': False,
+            'message': message,
+            'results': []
+        })
     elif isinstance(results, list):
         # Return search results array (including Spotify ID lookups)
         return jsonify({

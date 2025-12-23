@@ -801,7 +801,8 @@ def spotify_get_search_results(token, search_term, content_types, _retry=False):
     params['q'] = search_term
     params['type'] = ",".join(c_type for c_type in content_types)
 
-    max_attempts = 3
+    max_attempts = config.get('api_retry_max_attempts', 3)
+    default_delay = config.get('api_retry_default_delay', 1)
     attempt = 0
     response = None
     while attempt < max_attempts:
@@ -810,9 +811,9 @@ def spotify_get_search_results(token, search_term, content_types, _retry=False):
             break
         retry_after = response.headers.get("Retry-After")
         try:
-            wait_seconds = int(retry_after) if retry_after is not None else 1
+            wait_seconds = int(retry_after) if retry_after is not None else default_delay
         except ValueError:
-            wait_seconds = 1
+            wait_seconds = default_delay
         logger.warning(
             f"Spotify rate limit exceeded. Retrying in {wait_seconds}s "
             f"(attempt {attempt + 1}/{max_attempts})."
@@ -824,8 +825,15 @@ def spotify_get_search_results(token, search_term, content_types, _retry=False):
         logger.error("Spotify search failed: no response received.")
         return []
     if response.status_code == 429:
-        logger.error("Spotify rate limit exceeded. Please try again later.")
-        return []
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            logger.error(f"Spotify rate limit exceeded. Retry after {retry_after}s.")
+        else:
+            logger.error("Spotify rate limit exceeded. Please try again later.")
+        return {
+            "error": "Spotify rate limit exceeded.",
+            "retry_after": retry_after,
+        }
     if response.status_code != 200:
         logger.error(f"Spotify search failed: {response.status_code} - {response.text}")
         return []

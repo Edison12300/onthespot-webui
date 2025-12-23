@@ -117,6 +117,8 @@ class Config:
             "enable_retry_worker": False, # Enable retry worker, automatically retries failed downloads after a set time
             "retry_worker_delay": 10, # Amount of time to wait before retrying failed downloads, in minutes
             "download_stall_timeout": 5, # Seconds of no progress before reconnecting and restarting download
+            "api_retry_max_attempts": 3, # Max retries on API rate limit (429)
+            "api_retry_default_delay": 1, # Default delay (seconds) when Retry-After is missing
 
             # Search Settings
             "enable_search_tracks": True, # Enable listed category in search
