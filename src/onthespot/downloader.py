@@ -245,6 +245,7 @@ class DownloadWorker:
         available_accounts = self._get_available_accounts('spotify')
         
         max_retries_per_account = 2
+        alternative_track_unavailable = False
         
         # Try current account first
         if current_account_idx is not None and current_account_idx not in tried_accounts:
@@ -264,6 +265,8 @@ class DownloadWorker:
                                                                  'Unable to', 'Failed fetching audio key']))
 
                     if is_retryable:
+                        if 'Cannot get alternative track' in error_str:
+                            alternative_track_unavailable = True
                         if attempt < max_retries_per_account - 1:
                             logger.warning(f"Download stream failed ({error_type}, attempt {attempt + 1}) on account {current_account_idx}, reconnecting session: {e}")
                             try:
@@ -317,6 +320,8 @@ class DownloadWorker:
                                                                      'Unable to', 'Failed fetching audio key']))
 
                         if is_retryable:
+                            if 'Cannot get alternative track' in error_str:
+                                alternative_track_unavailable = True
                             if attempt < max_retries_per_account - 1:
                                 logger.warning(f"Fallback account {account_idx} stream failed ({error_type}, attempt {attempt + 1}), reconnecting: {e}")
                                 try:
@@ -337,6 +342,8 @@ class DownloadWorker:
                 continue
         
         # All accounts exhausted
+        if alternative_track_unavailable:
+            raise RuntimeError("Cannot get alternative track")
         raise RuntimeError(f"Failed to load audio stream after trying {len(tried_accounts)} account(s)")
 
     def _ensure_playlist_entry(self, item, item_metadata, base_path, default_format, final_path=None):
@@ -1304,6 +1311,12 @@ class DownloadWorker:
 
                 except RuntimeError as e:
                     error_str = str(e).lower()
+                    if "cannot get alternative track" in error_str:
+                        logger.error(f"Track is unavailable, track id '{item_id}'")
+                        item['item_status'] = 'Unavailable'
+                        self.update_progress(item, "Unavailable", 0)
+                        self.readd_item_to_download_queue(item)
+                        continue
                     # Session/auth errors are more serious - count them more heavily
                     is_session_error = any(x in error_str for x in [
                         'session', 'auth', 'failed to load audio stream', 
