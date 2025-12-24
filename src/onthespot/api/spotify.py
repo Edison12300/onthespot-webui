@@ -923,50 +923,69 @@ def spotify_get_search_results(token, search_term, content_types, _retry=False):
         if not items:
             continue
         for item in items:
-            item_type = item['type']
-            if item_type == "track":
-                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
-                item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item['artists']])}"
-                item_thumbnail_url = item['album']['images'][-1]["url"] if len(item['album']['images']) > 0 else ""
-            elif item_type == "album":
-                rel_year = re.search(r'(\d{4})', item['release_date']).group(1)
-                item_name = f"[Y:{rel_year}] [T:{item['total_tracks']}] {item['name']}"
-                item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item['artists']])}"
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-            elif item_type == "playlist":
-                tracks_total = item.get('tracks', {}).get('total')
-                if isinstance(tracks_total, int):
-                    playlist_id = item['id']
-                    if playlist_id in playlist_year_cache:
-                        rel_year = playlist_year_cache[playlist_id]
+            if not item:
+                logger.warning("Spotify search returned empty item in %s bucket.", key)
+                continue
+            try:
+                item_type = item['type']
+                if item_type == "track":
+                    album = item.get('album') or {}
+                    images = album.get('images') or []
+                    item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
+                    item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item.get('artists', [])])}"
+                    item_thumbnail_url = images[-1]["url"] if images else ""
+                elif item_type == "album":
+                    rel_year = re.search(r'(\d{4})', item.get('release_date', '')).group(1)
+                    images = item.get('images') or []
+                    item_name = f"[Y:{rel_year}] [T:{item['total_tracks']}] {item['name']}"
+                    item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item.get('artists', [])])}"
+                    item_thumbnail_url = images[-1]["url"] if images else ""
+                elif item_type == "playlist":
+                    tracks_total = item.get('tracks', {}).get('total')
+                    if isinstance(tracks_total, int):
+                        playlist_id = item['id']
+                        if playlist_id in playlist_year_cache:
+                            rel_year = playlist_year_cache[playlist_id]
+                        else:
+                            rel_year = spotify_get_playlist_updated_year(headers, playlist_id, tracks_total)
+                            playlist_year_cache[playlist_id] = rel_year
+                        item_name = f"[Y:{rel_year or '????'}] [T:{tracks_total}] {item['name']}"
                     else:
-                        rel_year = spotify_get_playlist_updated_year(headers, playlist_id, tracks_total)
-                        playlist_year_cache[playlist_id] = rel_year
-                    item_name = f"[Y:{rel_year or '????'}] [T:{tracks_total}] {item['name']}"
+                        item_name = f"{item['name']}"
+                    owner = item.get('owner') or {}
+                    images = item.get('images') or []
+                    item_by = f"{owner.get('display_name', '')}"
+                    item_thumbnail_url = images[-1]["url"] if images else ""
+                elif item_type == "artist":
+                    images = item.get('images') or []
+                    item_name = item['name']
+                    if f"{'/'.join(item.get('genres', []))}" != "":
+                        item_name = item['name'] + f"  |  GENERES: {'/'.join(item.get('genres', []))}"
+                    item_by = f"{item['name']}"
+                    item_thumbnail_url = images[-1]["url"] if images else ""
+                elif item_type == "show":
+                    images = item.get('images') or []
+                    item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
+                    item_by = f"{item.get('publisher', '')}"
+                    item_thumbnail_url = images[-1]["url"] if images else ""
+                    item_type = "podcast"
+                elif item_type == "episode":
+                    images = item.get('images') or []
+                    item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
+                    item_by = ""
+                    item_thumbnail_url = images[-1]["url"] if images else ""
+                    item_type = "podcast_episode"
+                elif item_type == "audiobook":
+                    images = item.get('images') or []
+                    item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
+                    item_by = f"{item.get('publisher', '')}"
+                    item_thumbnail_url = images[-1]["url"] if images else ""
                 else:
-                    item_name = f"{item['name']}"
-                item_by = f"{item['owner']['display_name']}"
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-            elif item_type == "artist":
-                item_name = item['name']
-                if f"{'/'.join(item['genres'])}" != "":
-                    item_name = item['name'] + f"  |  GENERES: {'/'.join(item['genres'])}"
-                item_by = f"{item['name']}"
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-            elif item_type == "show":
-                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
-                item_by = f"{item['publisher']}"
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-                item_type = "podcast"
-            elif item_type == "episode":
-                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
-                item_by = ""
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-                item_type = "podcast_episode"
-            elif item_type == "audiobook":
-                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
-                item_by = f"{item['publisher']}"
-                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
+                    logger.warning("Spotify search returned unsupported item type: %s", item_type)
+                    continue
+            except Exception as e:
+                logger.error("Spotify search item parse failed for %s: %s", item.get('id', 'unknown'), e)
+                continue
 
             search_results.append({
                 'item_id': item['id'],
