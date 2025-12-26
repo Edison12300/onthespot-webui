@@ -1176,10 +1176,11 @@ def spotify_get_track_metadata(token, item_id, _retry=False, album_lock=None):
     finally:
         if album_lock:
             album_lock.release()
+    track_audio_data = None
     try:
         track_audio_data = make_call(f'{BASE_URL}/audio-features/{item_id}', headers=headers)
     except Exception:
-        track_audio_data = ''
+        track_audio_data = None
     session_headers = None
     try:
         session_headers = {"Authorization": f"Bearer {token.tokens().get('user-read-email')}"}
@@ -1241,7 +1242,8 @@ def spotify_get_track_metadata(token, item_id, _retry=False, album_lock=None):
     info['item_url'] = track_data.get('tracks', [{}])[0].get('external_urls', {}).get('spotify')
     #info['popularity'] = track_data.get('tracks', [{}])[0].get('popularity')
     info['item_id'] = track_data.get('tracks', [{}])[0].get('id')
-    info['is_playable'] = track_data.get('tracks', [{}])[0].get('is_playable', False)
+    is_playable = track_data.get('tracks', [{}])[0].get('is_playable')
+    info['is_playable'] = True if is_playable is None else is_playable
 
     if credits_data:
         credits = {}
@@ -1254,7 +1256,7 @@ def spotify_get_track_metadata(token, item_id, _retry=False, album_lock=None):
         info['producers'] = conv_list_format([item for item in credits.get('producers', []) if isinstance(item, str)])
         info['writers'] = conv_list_format([item for item in credits.get('writers', []) if isinstance(item, str)])
 
-    if track_audio_data:
+    if isinstance(track_audio_data, dict) and 'tempo' in track_audio_data:
         key_mapping = {
             0: "C",
             1: "C♯/D♭",
