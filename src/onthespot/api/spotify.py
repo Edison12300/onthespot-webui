@@ -1179,8 +1179,13 @@ def spotify_get_track_metadata(token, item_id, _retry=False, album_lock=None):
     track_audio_data = None
     try:
         track_audio_data = make_call(f'{BASE_URL}/audio-features/{item_id}', headers=headers)
-    except Exception:
-        track_audio_data = None
+        # Ensure it's a dict, even if empty, to avoid key errors later
+        if not isinstance(track_audio_data, dict):
+            track_audio_data = {}
+    except Exception as e:
+        # Log the error but do NOT mark the track as unavailable
+        logger.warning(f"Audio-features unavailable for {item_id}: {e}")
+        track_audio_data = {}
     session_headers = None
     try:
         session_headers = {"Authorization": f"Bearer {token.tokens().get('user-read-email')}"}
@@ -1258,18 +1263,9 @@ def spotify_get_track_metadata(token, item_id, _retry=False, album_lock=None):
 
     if isinstance(track_audio_data, dict) and 'tempo' in track_audio_data:
         key_mapping = {
-            0: "C",
-            1: "C♯/D♭",
-            2: "D",
-            3: "D♯/E♭",
-            4: "E",
-            5: "F",
-            6: "F♯/G♭",
-            7: "G",
-            8: "G♯/A♭",
-            9: "A",
-            10: "A♯/B♭",
-            11: "B"
+        0: "C", 1: "C♯/D♭", 2: "D", 3: "D♯/E♭", 4: "E",
+        5: "F", 6: "F♯/G♭", 7: "G", 8: "G♯/A♭", 9: "A",
+        10: "A♯/B♭", 11: "B"
         }
         info['bpm'] = str(track_audio_data.get('tempo'))
         info['key'] = str(key_mapping.get(track_audio_data.get('key'), ''))
@@ -1282,7 +1278,7 @@ def spotify_get_track_metadata(token, item_id, _retry=False, album_lock=None):
         info['loudness'] = track_audio_data.get('loudness')
         info['speechiness'] = track_audio_data.get('speechiness')
         info['valence'] = track_audio_data.get('valence')
-    return info
+        return info
 
 
 def spotify_get_podcast_episode_metadata(token, episode_id, _retry=False):
