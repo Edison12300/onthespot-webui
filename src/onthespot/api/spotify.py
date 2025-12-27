@@ -9,6 +9,7 @@ import uuid
 from librespot.audio.decoders import AudioQuality
 from librespot.core import Session
 from librespot.zeroconf import ZeroconfServer
+from PyQt6.QtCore import QObject
 from ..otsconfig import config, cache_dir
 from ..runtimedata import get_logger, account_pool, pending, download_queue, pending_lock
 from ..utils import make_call, conv_list_format
@@ -16,154 +17,74 @@ from ..utils import make_call, conv_list_format
 logger = get_logger("api.spotify")
 BASE_URL = "https://api.spotify.com/v1"
 
-# Cache for album track IDs to avoid repeated API calls and race conditions
-_album_track_ids_cache = {}
-_album_track_ids_cache_lock = threading.Lock()
-
-# Cache for Spotify Web API client-credentials token
-_spotify_app_token = {"access_token": None, "expires_at": 0}
-_spotify_app_token_lock = threading.Lock()
+SPOTIFY_CLIENT_ID = "4271697581eb4b71b2b755ca8ca0ab46"
+SPOTIFY_CLIENT_SECRET = "5a770d24a6ab4457be0e3593d366d51e"
 
 
-def _mask_value(value, visible=6):
-    if not value:
-        return ""
-    if len(value) <= visible:
-        return value
-    return f"...{value[-visible:]}"
-
-
-def _spotify_get_app_access_token():
-    env_client_id = os.environ.get("ONTHESPOT_SPOTIFY_CLIENT_ID", "").strip()
-    env_client_secret = os.environ.get("ONTHESPOT_SPOTIFY_CLIENT_SECRET", "").strip()
-    cfg_client_id = config.get("spotify_client_id", "").strip()
-    cfg_client_secret = config.get("spotify_client_secret", "").strip()
-    client_id = env_client_id or cfg_client_id
-    client_secret = env_client_secret or cfg_client_secret
-    id_source = "env" if env_client_id else ("config" if cfg_client_id else "missing")
-    secret_source = "env" if env_client_secret else ("config" if cfg_client_secret else "missing")
-    logger.info(
-        "Spotify app creds status: client_id=%s (%s) client_secret=%s (%s)",
-        _mask_value(client_id),
-        id_source,
-        "set" if client_secret else "missing",
-        secret_source,
-    )
-    if not client_id or not client_secret:
-        logger.info("Spotify app creds missing; skipping client-credentials token.")
-        return None
-
-    now = time.time()
-    with _spotify_app_token_lock:
-        if _spotify_app_token["access_token"] and _spotify_app_token["expires_at"] > now + 30:
-            ttl = int(_spotify_app_token["expires_at"] - now)
-            logger.info("Spotify app token cache hit (ttl=%ss).", ttl)
-            return _spotify_app_token["access_token"]
-
-        logger.info(
-            "Requesting Spotify app token with client_id=%s secret=%s",
-            _mask_value(client_id),
-            "set" if client_secret else "missing",
-        )
-        try:
-            resp = requests.post(
-                "https://accounts.spotify.com/api/token",
-                data={"grant_type": "client_credentials"},
-                auth=(client_id, client_secret),
-                timeout=10,
-            )
-        except requests.RequestException as e:
-            logger.error("Spotify app token request failed: %s", e)
-            return None
-
-        if resp.status_code != 200:
-            logger.error(
-                "Spotify app token request error: %s - %s",
-                resp.status_code,
-                resp.text,
-            )
-            return None
-
-        data = resp.json()
-        access_token = data.get("access_token")
-        expires_in = int(data.get("expires_in", 0))
-        if not access_token:
-            logger.error("Spotify app token response missing access_token.")
-            return None
-
-        _spotify_app_token["access_token"] = access_token
-        _spotify_app_token["expires_at"] = now + expires_in
-        logger.info("Spotify app token refreshed (expires_in=%ss).", expires_in)
-        return access_token
-
-
-def _spotify_get_public_api_headers(token, context):
-    app_token = _spotify_get_app_access_token()
-    if app_token:
-        logger.info("Spotify %s using app token.", context)
-        return {"Authorization": f"Bearer {app_token}"}, "app"
-
-    logger.info("Spotify %s using session token.", context)
-    return {"Authorization": f"Bearer {token.tokens().get('user-read-email')}"}, "session"
-
-
-def _spotify_extract_year(value):
-    if not value:
-        return None
-    match = re.search(r'(\d{4})', str(value))
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
-
-
-def spotify_get_playlist_updated_year(headers, playlist_id, tracks_total):
-    """Best-effort playlist "updated year" based on newest track `added_at`.
-
-    Spotify playlist objects don't expose an explicit last-updated timestamp.
-    This approximates it by sampling `added_at` from the first and last track.
-    """
-    if not isinstance(tracks_total, int) or tracks_total <= 0:
-        return None
-
-    def _fetch_added_at(offset):
-        resp = make_call(
-            f"{BASE_URL}/playlists/{playlist_id}/tracks",
-            params={
-                'offset': str(max(0, offset)),
-                'limit': '1',
-                'fields': 'items(added_at)'
-            },
-            headers=headers,
-            skip_cache=True,
-        )
-        if not resp or not resp.get('items'):
-            return None
-        return resp['items'][0].get('added_at')
-
-    first_added_at = _fetch_added_at(0)
-    last_added_at = _fetch_added_at(tracks_total - 1)
-
-    years = []
-    for added_at in (first_added_at, last_added_at):
-        year = _spotify_extract_year(added_at)
-        if year is not None:
-            years.append(year)
-
-    return str(max(years)) if years else None
-
-def clear_album_track_ids_cache():
-    """Clear the album track IDs cache to free memory."""
-    with _album_track_ids_cache_lock:
-        count = len(_album_track_ids_cache)
-        _album_track_ids_cache.clear()
-        logger.info(f"Cleared album track IDs cache ({count} entries)")
-
-
-class MirrorSpotifyPlayback:
+class SpotifyTokenManager:
+    
     def __init__(self):
+        self.access_token = None
+        self.token_expiry = 0
+        self.token_lock = threading.Lock()
+        self.last_token_time = 0
+        self.token_interval = 1800
+    
+    def get_token(self):
+        with self.token_lock:
+            current_time = time.time()
+            
+            if self.access_token and current_time < self.token_expiry:
+                if current_time - self.last_token_time > 300:
+                    remaining = int(self.token_expiry - current_time)
+                    logger.debug(f"Using existing Spotify token. Expires in {remaining}s")
+                return self.access_token
+            
+            logger.info("Getting new Spotify token via Client Credentials Flow")
+            token_url = "https://accounts.spotify.com/api/token"
+            
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+            
+            data = {
+                "grant_type": "client_credentials",
+                "client_id": SPOTIFY_CLIENT_ID,
+                "client_secret": SPOTIFY_CLIENT_SECRET
+            }
+            
+            try:
+                response = requests.post(token_url, headers=headers, data=data, timeout=10)
+                response.raise_for_status()
+                
+                token_data = response.json()
+                self.access_token = token_data["access_token"]
+                expires_in = token_data["expires_in"]
+                
+                self.token_expiry = current_time + expires_in - 60
+                self.last_token_time = current_time
+                
+                logger.info(f"Token obtained successfully. Expires in {expires_in}s")
+                return self.access_token
+                
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error getting token: {str(e)}")
+                if 'response' in locals():
+                    logger.error(f"Status code: {response.status_code}, Response: {response.text}")
+                return None
+            except KeyError as e:
+                logger.error(f"Unexpected response format from Spotify: {str(e)}")
+                if 'response' in locals():
+                    logger.error(f"Response: {response.text}")
+                return None
+
+
+token_manager = SpotifyTokenManager()
+
+
+class MirrorSpotifyPlayback(QObject):
+    def __init__(self):
+        super().__init__()
         self.thread = None
         self.is_running = False
 
@@ -186,14 +107,12 @@ class MirrorSpotifyPlayback:
             logger.warning('SpotifyMirrorPlayback is not running.')
 
     def run(self):
-        # Circular Import
         from ..accounts import get_account_token
         while self.is_running:
             time.sleep(5)
             try:
                 token = get_account_token('spotify').tokens()
             except (AttributeError, IndexError):
-                # Account pool hasn't been filled yet
                 continue
             url = f"{BASE_URL}/me/player/currently-playing"
             try:
@@ -228,8 +147,6 @@ class MirrorSpotifyPlayback:
                                 parent_category = 'playlist'
                             elif data['context'].get('type') in ('album', 'artist'):
                                 parent_category = 'album'
-                        # Use item id to prevent duplicates
-                        #local_id = format_local_id(item_id)
                         with pending_lock:
                             pending[item_id] = {
                                 'local_id': item_id,
@@ -273,8 +190,6 @@ def spotify_new_session():
                 logger.info("Account already exists")
                 return False
             else:
-                # I wish there was a way to get credentials without saving to
-                # a file and parsing it but not currently sure how.
                 try:
                     with open(session_json_path, 'r') as file:
                         zeroconf_login = json.load(file)
@@ -305,8 +220,6 @@ def spotify_new_session():
 
 def spotify_login_user(account):
     try:
-        # I'd prefer to use 'Session.Builder().stored(credentials).create but
-        # I can't get it to work, loading from credentials file instead.
         uuid = account['uuid']
         username = account['login']['username']
 
@@ -321,7 +234,6 @@ def spotify_login_user(account):
             logger.error(f"Error writing to file {session_json_path}: {str(e)}\nTraceback: {traceback.format_exc()}")
 
         config = Session.Configuration.Builder().set_stored_credential_file(session_json_path).build()
-        # For some reason initialising session as None prevents premature application exit
         session = None
         try:
             session = Session.Builder(conf=config).stored_file(session_json_path).create()
@@ -330,10 +242,17 @@ def spotify_login_user(account):
             session = Session.Builder(conf=config).stored_file(session_json_path).create()
         logger.debug("Session created")
         logger.info(f"Login successful for user '{username[:4]}*******'")
-        account_type = session.get_user_attribute("type")
+        
+        account_type = "free"
         bitrate = "160k"
-        if account_type == "premium":
-            bitrate = "320k"
+        if session:
+            try:
+                account_type = session.get_user_attribute("type")
+                if account_type == "premium":
+                    bitrate = "320k"
+            except:
+                pass
+        
         account_pool.append({
             "uuid": uuid,
             "username": username,
@@ -364,195 +283,66 @@ def spotify_login_user(account):
         return False
 
 
-def spotify_re_init_session(account, max_retries=4, force=False):
-    """
-    NUCLEAR OPTION: Completely destroy and recreate a Spotify session from scratch.
-
-    This aggressively cleans up ALL session state and forces a completely fresh session.
-    Librespot sessions go stale and this ensures we start with a clean slate.
-
-    RATE LIMITED: Won't reconnect more than once per 30 seconds unless forced.
-
-    Args:
-        account: Account dictionary containing session information
-        max_retries: Maximum number of connection retry attempts (default: 4)
-        force: If True, bypass rate limiting and force reconnection
-    """
-    import gc
-    import time
-
+def spotify_re_init_session(account):
     session_json_path = os.path.join(cache_dir(), "sessions", f"ots_login_{account['uuid']}.json")
-    username = account.get('username', 'unknown')
-
-    # Rate limiting: Don't reconnect more than once per 30 seconds
-    MIN_RECONNECT_INTERVAL = 30  # seconds
-    last_reconnect = account.get('last_reconnect_time', 0)
-    time_since_last = time.time() - last_reconnect
-
-    if not force and time_since_last < MIN_RECONNECT_INTERVAL:
-        logger.info(
-            f"Rate limit: Session for {username} was reconnected {time_since_last:.1f}s ago, "
-            f"skipping reconnection (min interval: {MIN_RECONNECT_INTERVAL}s)"
-        )
-        # Return existing session without reconnecting
-        return account.get('login', {}).get('session')
-
-    logger.info(f"NUCLEAR SESSION RESET for account {username} (UUID: {account['uuid']})")
-
-    # STEP 1: Aggressively destroy old session
-    old_session = account.get('login', {}).get('session')
-    if old_session:
-        try:
-            # Try to close it
-            old_session.close()
-            logger.debug(f"Closed old session for {username}")
-        except Exception as e:
-            logger.warning(f"Error closing old session (will force cleanup anyway): {e}")
-
-        # Delete ALL references to force cleanup
-        try:
-            if 'session' in account.get('login', {}):
-                del account['login']['session']
-            del old_session
-            logger.debug(f"Deleted old session references for {username}")
-        except Exception as e:
-            logger.warning(f"Error deleting session references: {e}")
-
-    # STEP 2: Force garbage collection to clean up librespot internals
-    gc.collect()
-    logger.debug("Forced garbage collection")
-
-    # STEP 3: Small delay to ensure everything is cleaned up
-    time.sleep(0.5)
-
-    # STEP 4: Create completely fresh session from stored credentials with retry logic
-    session = None
-    last_error = None
-
-    for attempt in range(max_retries):
-        try:
-            if attempt > 0:
-                # Exponential backoff: 2s, 4s, 8s, 16s
-                delay = 2 ** attempt
-                logger.info(f"Retry {attempt}/{max_retries-1} for {username} after {delay}s delay...")
-                time.sleep(delay)
-
-            logger.info(f"Creating fresh session for {username}... (attempt {attempt + 1}/{max_retries})")
-
-            # Build completely new config
-            session_config = Session.Configuration.Builder().set_stored_credential_file(session_json_path).build()
-
-            # Create completely new session - this establishes a new TCP connection
-            session = Session.Builder(conf=session_config).stored_file(session_json_path).create()
-
-            # Verify session is actually working
+    try:
+        config = Session.Configuration.Builder().set_stored_credential_file(session_json_path).build()
+        logger.debug("Session config created")
+        session = Session.Builder(conf=config).stored_file(session_json_path).create()
+        logger.debug("Session re init done")
+        account['login']['session_path'] = session_json_path
+        account['login']['session'] = session
+        account['status'] = 'active'
+        
+        account_type = "free"
+        bitrate = "160k"
+        if session:
             try:
                 account_type = session.get_user_attribute("type")
-                logger.info(f"✓ NEW SESSION ACTIVE for {username} (type: {account_type})")
-            except Exception as verify_err:
-                logger.error(f"New session created but verification failed: {verify_err}")
-                raise RuntimeError(f"Session verification failed: {verify_err}")
-
-            # Update account with fresh session
-            account['login']['session_path'] = session_json_path
-            account['login']['session'] = session
-            account['status'] = 'active'
-            account['account_type'] = account_type
-            account['bitrate'] = "320k" if account_type == "premium" else "160k"
-            account['last_reconnect_time'] = time.time()  # Track reconnection time for rate limiting
-
-            logger.info(f"✓ NUCLEAR SESSION RESET SUCCESSFUL for {username} (bitrate: {account['bitrate']})")
-            return session
-
-        except (ConnectionRefusedError, ConnectionError, OSError, TimeoutError) as e:
-            last_error = e
-            error_type = type(e).__name__
-            logger.warning(f"Connection error during session creation (attempt {attempt + 1}/{max_retries}): {error_type} - {e}")
-
-            # Clean up failed session attempt
-            if session:
-                try:
-                    session.close()
-                except:
-                    pass
-                session = None
-
-            # If this was the last attempt, we'll raise the error below
-            if attempt == max_retries - 1:
-                logger.error(f"✗ All {max_retries} connection attempts failed for {username}")
-                break
-
-        except Exception as e:
-            # For non-connection errors, fail immediately
-            last_error = e
-            logger.error(f'✗ NUCLEAR SESSION RESET FAILED for {username}: {e}')
-            account['status'] = 'error'
-            raise RuntimeError(f"Failed to recreate session for {username}: {e}")
-
-    # If we get here, all retries failed
-    account['status'] = 'error'
-    raise RuntimeError(f"Failed to recreate session for {username} after {max_retries} attempts: {last_error}")
+                if account_type == "premium":
+                    bitrate = "320k"
+            except:
+                pass
+        
+        account['account_type'] = account_type
+        account['bitrate'] = bitrate
+    except:
+        logger.error('Failed to re init session !')
 
 
 def spotify_get_token(parsing_index):
-    """
-    Get Spotify session token.
-
-    LAZY RECONNECTION: Only recreates session when it's actually invalid,
-    not proactively. Sessions can stay healthy for hours if properly managed.
-
-    The old 30-second cooldown was counter-productive - it caused:
-    - Unnecessary Spotify API load → rate limiting
-    - TCP connection churn → connection resets
-    - More problems than it solved
-
-    Sessions go stale from INACTIVITY (30-60 min), not age.
-    """
-    username = account_pool[parsing_index].get('username', 'unknown')
-
-    try:
-        token = account_pool[parsing_index]['login']['session']
-        # Check if session is a valid object (not an empty string from failed login)
-        if not token or isinstance(token, str):
-            raise AttributeError("Session is empty or invalid")
-        logger.debug(f"Using existing session for {username}")
-        return token
-
-    except (OSError, AttributeError, KeyError) as e:
-        # Session missing or invalid - recreate ONLY when needed
-        logger.info(f'Session invalid for {username} ({e}), recreating...')
-        spotify_re_init_session(account_pool[parsing_index])
-        token = account_pool[parsing_index]['login']['session']
-        return token
+    use_client_credentials = config.get('spotify_use_client_credentials', True)
+    
+    if use_client_credentials:
+        return token_manager.get_token()
+    else:
+        if parsing_index < len(account_pool):
+            account = account_pool[parsing_index]
+            if account['login'].get('session'):
+                try:
+                    return account['login']['session'].tokens().get("user-read-private")
+                except:
+                    pass
+        return token_manager.get_token()
 
 
-def spotify_get_artist_album_ids(token, artist_id, _retry=False):
+def spotify_get_artist_album_ids(access_token, artist_id):
     logger.info(f"Getting album ids for artist: '{artist_id}'")
     items = []
     offset = 0
     limit = 50
     while True:
         headers = {}
-        try:
-            headers, auth_source = _spotify_get_public_api_headers(token, "artist albums")
-        except (RuntimeError, OSError) as e:
-            if _retry:
-                logger.error(f"Failed to get token after retry for artist {artist_id}: {e}")
-                raise
-            logger.warning(f"Token retrieval failed for artist album IDs, attempting session reconnect: {e}")
-            # Re-initialize the session
-            parsing_index = config.get('active_account_number')
-            spotify_re_init_session(account_pool[parsing_index])
-            # Get the new token
-            new_token = account_pool[parsing_index]['login']['session']
-            # Retry with the new token
-            return spotify_get_artist_album_ids(new_token, artist_id, _retry=True)
+        headers['Authorization'] = f"Bearer {access_token}"
 
-        url = f'{BASE_URL}/artists/{artist_id}/albums?include_groups=album%2Csingle&limit={limit}&offset={offset}' #%2Cappears_on%2Ccompilation
-        artist_data = make_call(url, headers=headers)
-        if artist_data is None:
-            logger.error("Spotify artist albums request failed (%s) for %s", auth_source, artist_id)
-            return []
+        url = f'{BASE_URL}/artists/{artist_id}/albums?include_groups=album%2Csingle&limit={limit}&offset={offset}'
+        
+        try:
+            artist_data = make_call(url, headers=headers)
+            if not artist_data or 'items' not in artist_data:
+                break
+        except:
+            break
 
         offset += limit
         items.extend(artist_data['items'])
@@ -566,36 +356,17 @@ def spotify_get_artist_album_ids(token, artist_id, _retry=False):
     return item_ids
 
 
-def spotify_get_playlist_data(token, playlist_id, _retry=False):
+def spotify_get_playlist_data(access_token, playlist_id):
     logger.info(f"Get playlist data for playlist: {playlist_id}")
     headers = {}
-    try:
-        headers['Authorization'] = f"Bearer {token.tokens().get('user-read-email')}"
-    except (RuntimeError, OSError) as e:
-        if _retry:
-            logger.error(f"Failed to get token after retry for playlist {playlist_id}: {e}")
-            raise
-        logger.warning(f"Token retrieval failed for playlist data, attempting session reconnect: {e}")
-        # Re-initialize the session
-        parsing_index = config.get('active_account_number')
-        spotify_re_init_session(account_pool[parsing_index])
-        # Get the new token
-        new_token = account_pool[parsing_index]['login']['session']
-        # Retry with the new token
-        return spotify_get_playlist_data(new_token, playlist_id, _retry=True)
-
+    headers['Authorization'] = f"Bearer {access_token}"
     resp = make_call(f'{BASE_URL}/playlists/{playlist_id}', headers=headers, skip_cache=True)
-    # Get highest quality playlist image (first image is highest quality)
-    image_url = ''
-    if resp.get('images') and len(resp['images']) > 0:
-        image_url = resp['images'][0].get('url', '')
-        logger.info(f"Playlist image URL: {image_url}")
-    else:
-        logger.warning(f"No playlist images found for playlist {playlist_id}")
-    return resp['name'], resp['owner']['display_name'], image_url
+    if resp:
+        return resp.get('name', ''), resp.get('owner', {}).get('display_name', '')
+    return '', ''
 
 
-def spotify_get_lyrics(token, item_id, item_type, metadata, filepath, _retry=False):
+def spotify_get_lyrics(access_token, item_id, item_type, metadata, filepath):
     if config.get('download_lyrics'):
         lyrics = []
         try:
@@ -606,21 +377,7 @@ def spotify_get_lyrics(token, item_id, item_type, metadata, filepath, _retry=Fal
 
             headers = {}
             headers['app-platform'] = 'WebPlayer'
-            try:
-                headers['Authorization'] = f'Bearer {token.tokens().get("user-read-email")}'
-            except (RuntimeError, OSError) as e:
-                if _retry:
-                    logger.error(f"Failed to get token after retry for lyrics {item_id}: {e}")
-                    raise
-                logger.warning(f"Token retrieval failed for lyrics, attempting session reconnect: {e}")
-                # Re-initialize the session
-                parsing_index = config.get('active_account_number')
-                spotify_re_init_session(account_pool[parsing_index])
-                # Get the new token
-                new_token = account_pool[parsing_index]['login']['session']
-                # Retry with the new token
-                return spotify_get_lyrics(new_token, item_id, item_type, metadata, filepath, _retry=True)
-
+            headers['Authorization'] = f'Bearer {access_token}'
             headers['user-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.90 Safari/537.36'
 
             resp = make_call(url, headers=headers)
@@ -705,7 +462,7 @@ def spotify_get_lyrics(token, item_id, item_type, metadata, filepath, _retry=Fal
         return False
 
 
-def spotify_get_playlist_items(token, playlist_id, _retry=False):
+def spotify_get_playlist_items(access_token, playlist_id):
     logger.info(f"Getting items in playlist: '{playlist_id}'")
     items = []
     offset = 0
@@ -714,23 +471,15 @@ def spotify_get_playlist_items(token, playlist_id, _retry=False):
     while True:
         url = f'{BASE_URL}/playlists/{playlist_id}/tracks?additional_types=track%2Cepisode&offset={offset}&limit={limit}'
         headers = {}
-        try:
-            headers['Authorization'] = f"Bearer {token.tokens().get('user-read-email')}"
-        except (RuntimeError, OSError) as e:
-            if _retry:
-                logger.error(f"Failed to get token after retry for playlist items {playlist_id}: {e}")
-                raise
-            logger.warning(f"Token retrieval failed for playlist items, attempting session reconnect: {e}")
-            # Re-initialize the session
-            parsing_index = config.get('active_account_number')
-            spotify_re_init_session(account_pool[parsing_index])
-            # Get the new token
-            new_token = account_pool[parsing_index]['login']['session']
-            # Retry with the new token
-            return spotify_get_playlist_items(new_token, playlist_id, _retry=True)
+        headers['Authorization'] = f"Bearer {access_token}"
 
         resp = make_call(url, headers=headers, skip_cache=True)
 
+        if resp is None:
+            logger.error(f"Failed to get playlist items. Rate limited or other error.")
+            time.sleep(5)
+            continue
+            
         offset += limit
         items.extend(resp['items'])
 
@@ -739,7 +488,7 @@ def spotify_get_playlist_items(token, playlist_id, _retry=False):
     return items
 
 
-def spotify_get_liked_songs(token, _retry=False):
+def spotify_get_liked_songs(access_token):
     logger.info("Getting liked songs")
     items = []
     offset = 0
@@ -748,23 +497,13 @@ def spotify_get_liked_songs(token, _retry=False):
     while True:
         url = f'{BASE_URL}/me/tracks?offset={offset}&limit={limit}'
         headers = {}
-        try:
-            headers['Authorization'] = f"Bearer {token.tokens().get('user-library-read')}"
-        except (RuntimeError, OSError) as e:
-            if _retry:
-                logger.error(f"Failed to get token after retry for liked songs: {e}")
-                raise
-            logger.warning(f"Token retrieval failed for liked songs, attempting session reconnect: {e}")
-            # Re-initialize the session
-            parsing_index = config.get('active_account_number')
-            spotify_re_init_session(account_pool[parsing_index])
-            # Get the new token
-            new_token = account_pool[parsing_index]['login']['session']
-            # Retry with the new token
-            return spotify_get_liked_songs(new_token, _retry=True)
+        headers['Authorization'] = f"Bearer {access_token}"
 
         resp = make_call(url, headers=headers, skip_cache=True)
 
+        if resp is None:
+            break
+            
         offset += limit
         items.extend(resp['items'])
 
@@ -773,7 +512,7 @@ def spotify_get_liked_songs(token, _retry=False):
     return items
 
 
-def spotify_get_your_episodes(token, _retry=False):
+def spotify_get_your_episodes(access_token):
     logger.info("Getting your episodes")
     items = []
     offset = 0
@@ -781,25 +520,14 @@ def spotify_get_your_episodes(token, _retry=False):
 
     while True:
         headers = {}
-        try:
-            headers['Authorization'] = f"Bearer {token.tokens().get('user-library-read')}"
-        except (RuntimeError, OSError) as e:
-            if _retry:
-                logger.error(f"Failed to get token after retry for your episodes: {e}")
-                raise
-            logger.warning(f"Token retrieval failed for your episodes, attempting session reconnect: {e}")
-            # Re-initialize the session
-            parsing_index = config.get('active_account_number')
-            spotify_re_init_session(account_pool[parsing_index])
-            # Get the new token
-            new_token = account_pool[parsing_index]['login']['session']
-            # Retry with the new token
-            return spotify_get_your_episodes(new_token, _retry=True)
-
+        headers['Authorization'] = f"Bearer {access_token}"
         url = f'{BASE_URL}/me/episodes?offset={offset}&limit={limit}'
 
         resp = make_call(url, headers=headers, skip_cache=True)
 
+        if resp is None:
+            break
+            
         offset += limit
         items.extend(resp['items'])
 
@@ -808,14 +536,7 @@ def spotify_get_your_episodes(token, _retry=False):
     return items
 
 
-def spotify_get_album_track_ids(token, album_id, _retry=False):
-    # Check cache first (thread-safe)
-    with _album_track_ids_cache_lock:
-        if album_id in _album_track_ids_cache:
-            logger.debug(f"Using cached track IDs for album: {album_id}")
-            return _album_track_ids_cache[album_id]
-    
-    # Not in cache, fetch from API
+def spotify_get_album_track_ids(access_token, album_id):
     logger.info(f"Getting tracks from album: {album_id}")
     tracks = []
     offset = 0
@@ -824,26 +545,12 @@ def spotify_get_album_track_ids(token, album_id, _retry=False):
     while True:
         url=f'{BASE_URL}/albums/{album_id}/tracks?offset={offset}&limit={limit}'
         headers = {}
-        try:
-            headers, auth_source = _spotify_get_public_api_headers(token, "album tracks")
-        except (RuntimeError, OSError) as e:
-            if _retry:
-                logger.error(f"Failed to get token after retry for album {album_id}: {e}")
-                raise
-            logger.warning(f"Token retrieval failed for album track IDs, attempting session reconnect: {e}")
-            # Re-initialize the session
-            parsing_index = config.get('active_account_number')
-            spotify_re_init_session(account_pool[parsing_index])
-            # Get the new token
-            new_token = account_pool[parsing_index]['login']['session']
-            # Retry with the new token
-            return spotify_get_album_track_ids(new_token, album_id, _retry=True)
+        headers['Authorization'] = f"Bearer {access_token}"
+        resp = make_call(url, headers=headers)
 
-        resp = make_call(url, headers=headers, skip_cache=True)
         if resp is None:
-            logger.error("Spotify album tracks request failed (%s) for %s", auth_source, album_id)
-            return []
-
+            break
+            
         offset += limit
         tracks.extend(resp['items'])
 
@@ -854,154 +561,64 @@ def spotify_get_album_track_ids(token, album_id, _retry=False):
     for track in tracks:
         if track:
             item_ids.append(track['id'])
-    
-    logger.info(f"Album {album_id} has {len(item_ids)} tracks with IDs: {item_ids[:5]}{'...' if len(item_ids) > 5 else ''}")
-    
-    # Store in cache (thread-safe)
-    with _album_track_ids_cache_lock:
-        _album_track_ids_cache[album_id] = item_ids
-    
     return item_ids
 
 
-def spotify_get_search_results(token, search_term, content_types, _retry=False):
+def spotify_get_search_results(access_token, search_term, content_types):
     logger.info(f"Get search result for term '{search_term}'")
 
     headers = {}
-    auth_source = "session"
-    app_token = _spotify_get_app_access_token()
-    if app_token:
-        headers['Authorization'] = f"Bearer {app_token}"
-        auth_source = "app"
-        logger.info("Spotify search using app token.")
-    else:
-        try:
-            headers['Authorization'] = f"Bearer {token.tokens().get('user-read-email')}"
-            logger.info("Spotify search using session token.")
-        except (RuntimeError, OSError, ConnectionError, Exception) as e:
-            if _retry:
-                logger.error(f"Failed to get token after retry: {e}")
-                raise
-            logger.warning(f"Token retrieval failed, attempting session reconnect: {e}")
-            try:
-                # Re-initialize the session with retry logic
-                parsing_index = config.get('active_account_number')
-                spotify_re_init_session(account_pool[parsing_index])
-                # Get the new token
-                new_token = account_pool[parsing_index]['login']['session']
-                # Retry the search with the new token
-                return spotify_get_search_results(new_token, search_term, content_types, _retry=True)
-            except Exception as reconnect_error:
-                logger.error(f"Failed to reconnect and search: {reconnect_error}")
-                raise
+    headers['Authorization'] = f"Bearer {access_token}"
 
     params = {}
     params['limit'] = config.get("max_search_results")
     params['offset'] = '0'
     params['q'] = search_term
     params['type'] = ",".join(c_type for c_type in content_types)
-    logger.info(
-        "Spotify search request auth_source=%s types=%s limit=%s",
-        auth_source,
-        params['type'],
-        params['limit'],
-    )
 
-    response = requests.get(f"{BASE_URL}/search", params=params, headers=headers, timeout=10)
-    logger.info("Spotify search response status=%s auth_source=%s", response.status_code, auth_source)
-    if response.status_code == 429:
-        retry_after = response.headers.get("Retry-After")
-        if retry_after:
-            logger.error(f"Spotify rate limit exceeded ({auth_source}). Retry after {retry_after}s.")
-        else:
-            logger.error(f"Spotify rate limit exceeded ({auth_source}). Please try again later.")
-        return {
-            "error": "Spotify rate limit exceeded.",
-            "retry_after": retry_after,
-        }
-    if response.status_code != 200:
-        logger.error(f"Spotify search failed ({auth_source}): {response.status_code} - {response.text}")
-        return []
     try:
-        data = response.json()
-    except ValueError as e:
-        logger.error(f"Spotify search response JSON error: {e}; status {response.status_code} - {response.text}")
-        return []
-    if isinstance(data, dict) and data.get("error"):
-        logger.error(f"Spotify search error payload: {data.get('error')}")
+        data = requests.get(f"{BASE_URL}/search", params=params, headers=headers).json()
+    except:
         return []
 
     search_results = []
-    playlist_year_cache = {}
     for key in data.keys():
-        bucket = data.get(key, {})
-        items = bucket.get("items") if isinstance(bucket, dict) else None
-        if not items:
-            continue
-        for item in items:
-            if not item:
-                logger.warning("Spotify search returned empty item in %s bucket.", key)
-                continue
-            try:
-                item_type = item['type']
-                if item_type == "track":
-                    album = item.get('album') or {}
-                    images = album.get('images') or []
-                    item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
-                    item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item.get('artists', [])])}"
-                    item_thumbnail_url = images[-1]["url"] if images else ""
-                elif item_type == "album":
-                    rel_year = re.search(r'(\d{4})', item.get('release_date', '')).group(1)
-                    images = item.get('images') or []
-                    item_name = f"[Y:{rel_year}] [T:{item['total_tracks']}] {item['name']}"
-                    item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item.get('artists', [])])}"
-                    item_thumbnail_url = images[-1]["url"] if images else ""
-                elif item_type == "playlist":
-                    tracks_total = item.get('tracks', {}).get('total')
-                    if isinstance(tracks_total, int):
-                        playlist_id = item['id']
-                        if playlist_id in playlist_year_cache:
-                            rel_year = playlist_year_cache[playlist_id]
-                        else:
-                            rel_year = spotify_get_playlist_updated_year(headers, playlist_id, tracks_total)
-                            playlist_year_cache[playlist_id] = rel_year
-                        item_name = f"[Y:{rel_year or '????'}] [T:{tracks_total}] {item['name']}"
-                    else:
-                        item_name = f"{item['name']}"
-                    owner = item.get('owner') or {}
-                    images = item.get('images') or []
-                    item_by = f"{owner.get('display_name', '')}"
-                    item_thumbnail_url = images[-1]["url"] if images else ""
-                elif item_type == "artist":
-                    images = item.get('images') or []
-                    item_name = item['name']
-                    if f"{'/'.join(item.get('genres', []))}" != "":
-                        item_name = item['name'] + f"  |  GENERES: {'/'.join(item.get('genres', []))}"
-                    item_by = f"{item['name']}"
-                    item_thumbnail_url = images[-1]["url"] if images else ""
-                elif item_type == "show":
-                    images = item.get('images') or []
-                    item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
-                    item_by = f"{item.get('publisher', '')}"
-                    item_thumbnail_url = images[-1]["url"] if images else ""
-                    item_type = "podcast"
-                elif item_type == "episode":
-                    images = item.get('images') or []
-                    item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
-                    item_by = ""
-                    item_thumbnail_url = images[-1]["url"] if images else ""
-                    item_type = "podcast_episode"
-                elif item_type == "audiobook":
-                    images = item.get('images') or []
-                    item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
-                    item_by = f"{item.get('publisher', '')}"
-                    item_thumbnail_url = images[-1]["url"] if images else ""
-                else:
-                    logger.warning("Spotify search returned unsupported item type: %s", item_type)
-                    continue
-            except Exception as e:
-                logger.error("Spotify search item parse failed for %s: %s", item.get('id', 'unknown'), e)
-                continue
+        for item in data[key].get("items", []):
+            item_type = item['type']
+            if item_type == "track":
+                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
+                item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item['artists']])}"
+                item_thumbnail_url = item['album']['images'][-1]["url"] if len(item['album']['images']) > 0 else ""
+            elif item_type == "album":
+                rel_year_match = re.search(r'(\d{4})', item['release_date'])
+                rel_year = rel_year_match.group(1) if rel_year_match else ""
+                item_name = f"[Y:{rel_year}] [T:{item['total_tracks']}] {item['name']}"
+                item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item['artists']])}"
+                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
+            elif item_type == "playlist":
+                item_name = f"{item['name']}"
+                item_by = f"{item['owner']['display_name']}"
+                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
+            elif item_type == "artist":
+                item_name = item['name']
+                if f"{'/'.join(item['genres'])}" != "":
+                    item_name = item['name'] + f"  |  GENERES: {'/'.join(item['genres'])}"
+                item_by = f"{item['name']}"
+                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
+            elif item_type == "show":
+                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
+                item_by = f"{item['publisher']}"
+                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
+                item_type = "podcast"
+            elif item_type == "episode":
+                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
+                item_by = ""
+                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
+                item_type = "podcast_episode"
+            elif item_type == "audiobook":
+                item_name = f"{config.get('explicit_label') if item['explicit'] else ''} {item['name']}"
+                item_by = f"{item['publisher']}"
+                item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
 
             search_results.append({
                 'item_id': item['id'],
@@ -1015,245 +632,98 @@ def spotify_get_search_results(token, search_term, content_types, _retry=False):
     return search_results
 
 
-def spotify_get_item_by_id(token, item_id, item_type, _retry=False):
-    """
-    Fetch a single Spotify item by ID and return it as a search result.
-
-    Args:
-        token: Spotify session token
-        item_id: The 22-character Spotify ID
-        item_type: Type of item (track, album, playlist, artist, episode, show)
-
-    Returns:
-        List containing a single search result dict, or empty list on error
-    """
-    logger.info(f"Get item by ID: {item_type}/{item_id}")
-
+def spotify_get_track_metadata(access_token, item_id):
     headers = {}
-    try:
-        headers['Authorization'] = f"Bearer {token.tokens().get('user-read-email')}"
-    except (RuntimeError, OSError, ConnectionError, Exception) as e:
-        if _retry:
-            logger.error(f"Failed to get token after retry for item {item_type}/{item_id}: {e}")
-            return []
-        logger.warning(f"Token retrieval failed for item {item_type}/{item_id}, attempting session reconnect: {e}")
-        try:
-            parsing_index = config.get('active_account_number')
-            spotify_re_init_session(account_pool[parsing_index])
-            new_token = account_pool[parsing_index]['login']['session']
-            return spotify_get_item_by_id(new_token, item_id, item_type, _retry=True)
-        except Exception as retry_error:
-            logger.error(f"Failed to reconnect session for item {item_type}/{item_id}: {retry_error}")
-            return []
+    headers['Authorization'] = f"Bearer {access_token}"
 
-    # Map internal types to API endpoints
-    endpoint_type = item_type
-    if item_type == 'podcast':
-        endpoint_type = 'show'
-    elif item_type == 'podcast_episode':
-        endpoint_type = 'episode'
-
-    try:
-        # Fetch item data from Spotify API
-        response = requests.get(
-            f"{BASE_URL}/{endpoint_type}s/{item_id}",
-            headers=headers,
-            timeout=10
-        )
-        if response.status_code != 200:
-            logger.error(f"Failed to fetch {item_type} {item_id}: {response.status_code} - {response.text}")
-            return []
-
-        item = response.json()
-
-        # Format the result based on item type (same as search results)
-        if item_type == "track":
-            item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
-            item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item['artists']])}"
-            item_thumbnail_url = item['album']['images'][-1]["url"] if len(item['album']['images']) > 0 else ""
-        elif item_type == "album":
-            rel_year = re.search(r'(\d{4})', item['release_date']).group(1) if item.get('release_date') else '????'
-            item_name = f"[Y:{rel_year}] [T:{item['total_tracks']}] {item['name']}"
-            item_by = f"{config.get('metadata_separator').join([artist['name'] for artist in item['artists']])}"
-            item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-        elif item_type == "playlist":
-            tracks_total = item.get('tracks', {}).get('total')
-            if isinstance(tracks_total, int):
-                rel_year = spotify_get_playlist_updated_year(headers, item['id'], tracks_total)
-                item_name = f"[Y:{rel_year or '????'}] [T:{tracks_total}] {item['name']}"
-            else:
-                item_name = f"{item['name']}"
-            item_by = f"{item['owner']['display_name']}"
-            item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-        elif item_type == "artist":
-            item_name = item['name']
-            if f"{'/'.join(item.get('genres', []))}" != "":
-                item_name = item['name'] + f"  |  GENERES: {'/'.join(item['genres'])}"
-            item_by = f"{item['name']}"
-            item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-        elif item_type in ["show", "podcast"]:
-            item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
-            item_by = f"{item['publisher']}"
-            item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-            item_type = "podcast"
-        elif item_type in ["episode", "podcast_episode"]:
-            item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
-            item_by = ""
-            item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-            item_type = "podcast_episode"
-        elif item_type == "audiobook":
-            item_name = f"{config.get('explicit_label') if item.get('explicit') else ''} {item['name']}"
-            item_by = f"{item['publisher']}"
-            item_thumbnail_url = item['images'][-1]["url"] if len(item['images']) > 0 else ""
-        else:
-            logger.error(f"Unknown item type: {item_type}")
-            return []
-
-        return [{
-            'item_id': item['id'],
-            'item_name': item_name,
-            'item_by': item_by,
-            'item_type': item_type,
-            'item_service': "spotify",
-            'item_url': item['external_urls']['spotify'],
-            'item_thumbnail_url': item_thumbnail_url
-        }]
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Network error fetching item {item_type}/{item_id}: {e}")
-        return []
-    except (KeyError, ValueError, AttributeError) as e:
-        logger.error(f"Data parsing error for item {item_type}/{item_id}: {e}")
-        return []
-    except Exception as e:
-        logger.error(f"Unexpected error fetching item {item_type}/{item_id}: {e}")
-        return []
-
-
-def spotify_get_track_metadata(token, item_id, _retry=False, album_lock=None):
-    headers = {}
-    try:
-        headers, auth_source = _spotify_get_public_api_headers(token, "track metadata")
-    except (RuntimeError, OSError) as e:
-        if _retry:
-            logger.error(f"Failed to get token after retry for track {item_id}: {e}")
-            raise
-        logger.warning(f"Token retrieval failed for track metadata, attempting session reconnect: {e}")
-        # Re-initialize the session
-        parsing_index = config.get('active_account_number')
-        spotify_re_init_session(account_pool[parsing_index])
-        # Get the new token
-        new_token = account_pool[parsing_index]['login']['session']
-        # Retry with the new token
-        return spotify_get_track_metadata(new_token, item_id, _retry=True)
-
-    if auth_source == "session":
-        market_param = "from_token"
-        track_data = make_call(f'{BASE_URL}/tracks?ids={item_id}&market={market_param}', headers=headers)
-    else:
-        market_param = "EU"
-        track_data = make_call(f'{BASE_URL}/tracks?ids={item_id}&market={market_param}', headers=headers)
-        if not track_data or track_data.get('tracks', [{}])[0].get('is_playable') is False:
-            logger.info("Spotify track metadata EU unavailable for %s; falling back to US", item_id)
-            market_param = "US"
-            track_data = make_call(f'{BASE_URL}/tracks?ids={item_id}&market={market_param}', headers=headers)
-    if not track_data:
-        logger.error(
-            "Spotify track metadata request failed (%s, market=%s) for %s",
-            auth_source,
-            market_param,
-            item_id,
-        )
-        return {}
-    album_data = make_call(f"{BASE_URL}/albums/{track_data.get('tracks', [])[0].get('album', {}).get('id')}", headers=headers)
-    artist_data = make_call(f"{BASE_URL}/artists/{track_data.get('tracks', [])[0].get('artists', [])[0].get('id')}", headers=headers)
+    track_data = make_call(f'{BASE_URL}/tracks?ids={item_id}&market=from_token', headers=headers)
+    if not track_data or not track_data.get('tracks'):
+        logger.error(f"Failed to get track data for {item_id}")
+        return None
+        
+    track_info = track_data.get('tracks', [{}])[0]
+    if not track_info:
+        return None
+        
+    album_id = track_info.get('album', {}).get('id')
+    artist_id = track_info.get('artists', [{}])[0].get('id')
     
-    # Lock ONLY the album track ID fetch (critical section for duplicate prevention)
-    if album_lock:
-        album_lock.acquire()
+    album_data = {}
+    artist_data = {}
+    album_track_ids = []
+    
+    if album_id:
+        album_data = make_call(f"{BASE_URL}/albums/{album_id}", headers=headers) or {}
+        album_track_ids = spotify_get_album_track_ids(access_token, album_id) or []
+        
+    if artist_id:
+        artist_data = make_call(f"{BASE_URL}/artists/{artist_id}", headers=headers) or {}
+    
     try:
-        album_track_ids = spotify_get_album_track_ids(token, track_data.get('tracks', [])[0].get('album', {}).get('id'))
-    finally:
-        if album_lock:
-            album_lock.release()
-    track_audio_data = None
-    try:
-        track_audio_data = make_call(f'{BASE_URL}/audio-features/{item_id}', headers=headers)
-        # Ensure it's a dict, even if empty, to avoid key errors later
-        if not isinstance(track_audio_data, dict):
-            track_audio_data = {}
-    except Exception as e:
-        # Log the error but do NOT mark the track as unavailable
-        logger.warning(f"Audio-features unavailable for {item_id}: {e}")
-        track_audio_data = {}
-    session_headers = None
-    try:
-        session_headers = {"Authorization": f"Bearer {token.tokens().get('user-read-email')}"}
-    except (RuntimeError, OSError) as e:
-        logger.warning("Spotify credits request missing session token: %s", e)
-
-    try:
-        credits_headers = session_headers or headers
-        credits_data = make_call(
-            f'https://spclient.wg.spotify.com/track-credits-view/v0/experimental/{item_id}/credits',
-            headers=credits_headers,
-        )
+        track_audio_data = make_call(f'{BASE_URL}/audio-features/{item_id}', headers=headers) or {}
     except Exception:
-        credits_data = ''
+        track_audio_data = {}
+        
+    try:
+        credits_data = make_call(f'https://spclient.wg.spotify.com/track-credits-view/v0/experimental/{item_id}/credits', headers=headers) or {}
+    except Exception:
+        credits_data = {}
 
-    # Artists
     artists = []
-    for data in track_data.get('tracks', [{}])[0].get('artists', []):
-        artists.append(data.get('name'))
+    for data in track_info.get('artists', []):
+        artists.append(data.get('name', ''))
     artists = conv_list_format(artists)
 
-    # Track Number
     track_number = None
     if album_track_ids:
         for i, track_id in enumerate(album_track_ids):
             if track_id == str(item_id):
                 track_number = i + 1
-                logger.info(f"Track {item_id} found at position {track_number} in album track list")
                 break
     if not track_number:
-        track_number = track_data.get('tracks', [{}])[0].get('track_number')
-        logger.warning(f"Track {item_id} not found in album track list, using API track_number: {track_number}")
+        track_number = track_info.get('track_number', 1)
 
     info = {}
     info['artists'] = artists
-    info['album_name'] = track_data.get('tracks', [{}])[0].get('album', {}).get("name", '')
-    info['album_type'] = album_data.get('album_type')
-    info['album_artists'] = album_data.get('artists', [{}])[0].get('name')
-    info['title'] = track_data.get('tracks', [{}])[0].get('name')
+    info['album_name'] = track_info.get('album', {}).get("name", '')
+    info['album_type'] = album_data.get('album_type', '')
+    info['album_artists'] = album_data.get('artists', [{}])[0].get('name', '') if album_data.get('artists') else ''
+    info['title'] = track_info.get('name', '')
 
     try:
-        info['image_url'] = track_data.get('tracks', [{}])[0].get('album', {}).get('images', [{}])[0].get('url')
-    except IndexError:
+        info['image_url'] = track_info.get('album', {}).get('images', [{}])[0].get('url', '')
+    except (IndexError, KeyError):
         info['image_url'] = ''
-        logger.info('Invalid thumbnail')
 
-    info['release_year'] = track_data.get('tracks', [{}])[0].get('album', {}).get('release_date').split("-")[0]
-    #info['track_number'] = track_data.get('tracks', [{}])[0].get('track_number')
+    release_date = track_info.get('album', {}).get('release_date', '')
+    info['release_year'] = release_date.split("-")[0] if release_date else ''
     info['track_number'] = track_number
-    info['total_tracks'] = track_data.get('tracks', [{}])[0].get('album', {}).get('total_tracks')
-    info['disc_number'] = track_data.get('tracks', [{}])[0].get('disc_number')
-    info['total_discs'] = sorted([trk.get('disc_number', 0) for trk in album_data.get('tracks', {}).get('items', [])])[-1] if 'tracks' in album_data else 1
+    info['total_tracks'] = track_info.get('album', {}).get('total_tracks', 1)
+    info['disc_number'] = track_info.get('disc_number', 1)
+    
+    total_discs = 1
+    if album_data and 'tracks' in album_data:
+        items = album_data.get('tracks', {}).get('items', [])
+        if items:
+            disc_numbers = [trk.get('disc_number', 0) for trk in items]
+            if disc_numbers:
+                total_discs = max(disc_numbers)
+    info['total_discs'] = total_discs
+    
     info['genre'] = conv_list_format(artist_data.get('genres', []))
-    info['label'] = album_data.get('label')
-    info['copyright'] = conv_list_format([holder.get('text') for holder in album_data.get('copyrights', [])])
-    info['explicit'] = track_data.get('tracks', [{}])[0].get('explicit', False)
-    info['isrc'] = track_data.get('tracks', [{}])[0].get('external_ids', {}).get('isrc')
-    info['length'] = str(track_data.get('tracks', [{}])[0].get('duration_ms'))
-    info['item_url'] = track_data.get('tracks', [{}])[0].get('external_urls', {}).get('spotify')
-    #info['popularity'] = track_data.get('tracks', [{}])[0].get('popularity')
-    info['item_id'] = track_data.get('tracks', [{}])[0].get('id')
-    is_playable = track_data.get('tracks', [{}])[0].get('is_playable')
-    info['is_playable'] = True if is_playable is None else is_playable
+    info['label'] = album_data.get('label', '')
+    info['copyright'] = conv_list_format([holder.get('text', '') for holder in album_data.get('copyrights', [])])
+    info['explicit'] = track_info.get('explicit', False)
+    info['isrc'] = track_info.get('external_ids', {}).get('isrc', '')
+    info['length'] = str(track_info.get('duration_ms', 0))
+    info['item_url'] = track_info.get('external_urls', {}).get('spotify', '')
+    info['item_id'] = track_info.get('id', '')
+    info['is_playable'] = track_info.get('is_playable', False)
 
     if credits_data:
         credits = {}
         for credit_block in credits_data.get('roleCredits', []):
-            role_title = credit_block.get('roleTitle').lower()
+            role_title = credit_block.get('roleTitle', '').lower()
             credits[role_title] = [
                 artist.get('name') for artist in credit_block.get('artists', [])
             ]
@@ -1261,51 +731,50 @@ def spotify_get_track_metadata(token, item_id, _retry=False, album_lock=None):
         info['producers'] = conv_list_format([item for item in credits.get('producers', []) if isinstance(item, str)])
         info['writers'] = conv_list_format([item for item in credits.get('writers', []) if isinstance(item, str)])
 
-    if isinstance(track_audio_data, dict) and 'tempo' in track_audio_data:
+    if track_audio_data:
         key_mapping = {
-        0: "C", 1: "C♯/D♭", 2: "D", 3: "D♯/E♭", 4: "E",
-        5: "F", 6: "F♯/G♭", 7: "G", 8: "G♯/A♭", 9: "A",
-        10: "A♯/B♭", 11: "B"
+            0: "C",
+            1: "C♯/D♭",
+            2: "D",
+            3: "D♯/E♭",
+            4: "E",
+            5: "F",
+            6: "F♯/G♭",
+            7: "G",
+            8: "G♯/A♭",
+            9: "A",
+            10: "A♯/B♭",
+            11: "B"
         }
-        info['bpm'] = str(track_audio_data.get('tempo'))
-        info['key'] = str(key_mapping.get(track_audio_data.get('key'), ''))
-        info['time_signature'] = track_audio_data.get('time_signature')
-        info['acousticness'] = track_audio_data.get('acousticness')
-        info['danceability'] = track_audio_data.get('danceability')
-        info['energy'] = track_audio_data.get('energy')
-        info['instrumentalness'] = track_audio_data.get('instrumentalness')
-        info['liveness'] = track_audio_data.get('liveness')
-        info['loudness'] = track_audio_data.get('loudness')
-        info['speechiness'] = track_audio_data.get('speechiness')
-        info['valence'] = track_audio_data.get('valence')
-        return info
+        info['bpm'] = str(track_audio_data.get('tempo', ''))
+        info['key'] = str(key_mapping.get(track_audio_data.get('key', 0), ''))
+        info['time_signature'] = track_audio_data.get('time_signature', '')
+        info['acousticness'] = track_audio_data.get('acousticness', '')
+        info['danceability'] = track_audio_data.get('danceability', '')
+        info['energy'] = track_audio_data.get('energy', '')
+        info['instrumentalness'] = track_audio_data.get('instrumentalness', '')
+        info['liveness'] = track_audio_data.get('liveness', '')
+        info['loudness'] = track_audio_data.get('loudness', '')
+        info['speechiness'] = track_audio_data.get('speechiness', '')
+        info['valence'] = track_audio_data.get('valence', '')
+    return info
 
 
-def spotify_get_podcast_episode_metadata(token, episode_id, _retry=False):
+def spotify_get_podcast_episode_metadata(access_token, episode_id):
     logger.info(f"Get episode info for episode by id '{episode_id}'")
     headers = {}
-    try:
-        headers['Authorization'] = f"Bearer {token.tokens().get('user-read-email')}"
-    except (RuntimeError, OSError) as e:
-        if _retry:
-            logger.error(f"Failed to get token after retry for episode {episode_id}: {e}")
-            raise
-        logger.warning(f"Token retrieval failed for episode metadata, attempting session reconnect: {e}")
-        # Re-initialize the session
-        parsing_index = config.get('active_account_number')
-        spotify_re_init_session(account_pool[parsing_index])
-        # Get the new token
-        new_token = account_pool[parsing_index]['login']['session']
-        # Retry with the new token
-        return spotify_get_podcast_episode_metadata(new_token, episode_id, _retry=True)
-
+    headers['Authorization'] = f"Bearer {access_token}"
     episode_data = make_call(f"{BASE_URL}/episodes/{episode_id}", headers=headers)
-    show_episode_ids = spotify_get_podcast_episode_ids(token, episode_data.get('show', {}).get('id'))
-    # I believe audiobook ids start with a 7 but to verify you can use https://api.spotify.com/v1/audiobooks/{id}
-    # the endpoint could possibly be used to mark audiobooks in genre but it doesn't really provide any additional
-    # metadata compared to show_data beyond abridged and unabridged.
+    
+    if not episode_data:
+        return None
+        
+    show_id = episode_data.get('show', {}).get('id')
+    show_episode_ids = []
+    if show_id:
+        show_episode_ids = spotify_get_podcast_episode_ids(access_token, show_id)
 
-    track_number = ''
+    track_number = 1
     for index, episode in enumerate(show_episode_ids):
         if episode == episode_id:
             track_number = index + 1
@@ -1313,34 +782,39 @@ def spotify_get_podcast_episode_metadata(token, episode_id, _retry=False):
 
     copyrights = []
     for copyright in episode_data.get('show', {}).get('copyrights', []):
-        text = copyright.get('text')
+        text = copyright.get('text', '')
         copyrights.append(text)
 
     info = {}
-    info['album_name'] = episode_data.get('show', {}).get('name')
-    info['title'] = episode_data.get('name')
-    info['image_url'] = episode_data.get('images', [{}])[0].get('url')
-    info['release_year'] = episode_data.get('release_date').split('-')[0]
+    info['album_name'] = episode_data.get('show', {}).get('name', '')
+    info['title'] = episode_data.get('name', '')
+    info['image_url'] = episode_data.get('images', [{}])[0].get('url', '')
+    
+    release_date = episode_data.get('release_date', '')
+    info['release_year'] = release_date.split('-')[0] if release_date else ''
+    
     info['track_number'] = track_number
-    # Not accurate
-    #info['total_tracks'] = episode_data.get('show', {}).get('total_episodes', 0)
     info['total_tracks'] = len(show_episode_ids)
-    info['artists'] = conv_list_format([episode_data.get('show', {}).get('publisher')])
-    info['album_artists'] = conv_list_format([episode_data.get('show', {}).get('publisher')])
+    info['artists'] = conv_list_format([episode_data.get('show', {}).get('publisher', '')])
+    info['album_artists'] = conv_list_format([episode_data.get('show', {}).get('publisher', '')])
     info['language'] = conv_list_format(episode_data.get('languages', []))
-    description = episode_data.get('description')
-    info['description'] = str(description if description else episode_data.get('show', {}).get('description', ""))
+    
+    description = episode_data.get('description', '')
+    if not description:
+        description = episode_data.get('show', {}).get('description', '')
+    info['description'] = str(description)
+    
     info['copyright'] = conv_list_format(copyrights)
-    info['length'] = str(episode_data.get('duration_ms'))
-    info['explicit'] = episode_data.get('explicit')
-    info['is_playable'] = episode_data.get('is_playable')
-    info['item_url'] = episode_data.get('external_urls', {}).get('spotify')
-    info['item_id'] = episode_data.get('id')
+    info['length'] = str(episode_data.get('duration_ms', 0))
+    info['explicit'] = episode_data.get('explicit', False)
+    info['is_playable'] = episode_data.get('is_playable', False)
+    info['item_url'] = episode_data.get('external_urls', {}).get('spotify', '')
+    info['item_id'] = episode_data.get('id', '')
 
     return info
 
 
-def spotify_get_podcast_episode_ids(token, show_id, _retry=False):
+def spotify_get_podcast_episode_ids(access_token, show_id):
     logger.info(f"Getting show episodes: {show_id}'")
     episodes = []
     offset = 0
@@ -1349,23 +823,12 @@ def spotify_get_podcast_episode_ids(token, show_id, _retry=False):
     while True:
         url = f'{BASE_URL}/shows/{show_id}/episodes?offset={offset}&limit={limit}'
         headers = {}
-        try:
-            headers['Authorization'] = f"Bearer {token.tokens().get('user-read-email')}"
-        except (RuntimeError, OSError) as e:
-            if _retry:
-                logger.error(f"Failed to get token after retry for podcast episode IDs {show_id}: {e}")
-                raise
-            logger.warning(f"Token retrieval failed for podcast episode IDs, attempting session reconnect: {e}")
-            # Re-initialize the session
-            parsing_index = config.get('active_account_number')
-            spotify_re_init_session(account_pool[parsing_index])
-            # Get the new token
-            new_token = account_pool[parsing_index]['login']['session']
-            # Retry with the new token
-            return spotify_get_podcast_episode_ids(new_token, show_id, _retry=True)
-
+        headers['Authorization'] = f"Bearer {access_token}"
         resp = make_call(url, headers=headers)
 
+        if resp is None:
+            break
+            
         offset += limit
         episodes.extend(resp['items'])
 
